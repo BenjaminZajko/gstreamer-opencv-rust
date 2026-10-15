@@ -1,2 +1,6 @@
 target/
 *.mp4
+models/
+.DS_Store
+live.log
+live.pid
