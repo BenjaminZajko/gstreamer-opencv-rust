@@ -4,3 +4,4 @@ models/
 .DS_Store
 live.log
 live.pid
+out/

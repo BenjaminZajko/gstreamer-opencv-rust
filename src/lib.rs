@@ -2,19 +2,29 @@
 //! je len tenký obal; takto sa dajú moduly testovať aj z priečinka `tests/`.
 //!
 //! Moduly:
+//!   anchor    ukotvenie čiary a výrezu k scéne (sledovanie referenčných bodov)
 //!   args      argumenty z príkazového riadku
 //!   detector  detektory (OpenCV)
 //!   draw      kreslenie rámčekov
 //!   labels    názvy tried COCO
+//!   live_count  živé počítanie (výrez pre detekciu, sledovanie, čiara)
+//!   roi       orezanie záberu (región záujmu)
+//!   tracker   sledovanie objektov medzi snímkami (ID)
+//!   counter   počítanie prechodov cez zvislú čiaru
 //!   rtsp_out  vlastný RTSP server s anotovaným videom (live)
 //!   yolox     neurónová sieť YOLOX cez OpenCV DNN
 //!   video_io  GStreamer vstup/výstup a prevod snímok GStreamer <-> OpenCV
 
+pub mod anchor;
 pub mod args;
+pub mod counter;
 pub mod detector;
 pub mod draw;
 pub mod labels;
+pub mod live_count;
+pub mod roi;
 pub mod rtsp_out;
+pub mod tracker;
 pub mod video_io;
 pub mod yolox;
 

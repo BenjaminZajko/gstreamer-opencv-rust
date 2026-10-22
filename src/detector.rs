@@ -33,7 +33,8 @@ pub enum Detector {
     },
     Yolo {
         net: Yolox,
-        only_people: bool, // true = len ľudia, false = všetkých 80 tried
+        classes: Option<Vec<usize>>, // ktoré triedy hľadať (`None` = všetkých 80)
+        people_label: bool,          // true = popis "clovek" namiesto "person"
     },
 }
 
@@ -52,10 +53,25 @@ impl Detector {
                 )?,
                 warmup: 30, // prvých pár snímok sa pozadie učí, nič nehlásime
             },
-            Mode::People | Mode::Objects => Detector::Yolo {
+            Mode::People => Detector::Yolo {
                 net: Yolox::load(model, conf)?,
-                only_people: mode == Mode::People,
+                classes: Some(vec![PERSON]),
+                people_label: true,
             },
+            Mode::Objects => Detector::Yolo {
+                net: Yolox::load(model, conf)?,
+                classes: None,
+                people_label: false,
+            },
+        })
+    }
+
+    /// YOLOX detektor, ktorý hľadá len vybrané triedy (čísla tried COCO, pozri `labels`).
+    pub fn yolo_with_classes(model: &str, conf: f32, classes: &[usize]) -> Result<Self> {
+        Ok(Detector::Yolo {
+            net: Yolox::load(model, conf)?,
+            classes: Some(classes.to_vec()),
+            people_label: false,
         })
     }
 
@@ -66,14 +82,13 @@ impl Detector {
                 .into_iter()
                 .map(|rect| Detection { rect, label: "pohyb".into(), score: None })
                 .collect()),
-            Detector::Yolo { net, only_people } => {
-                let only = only_people.then_some(PERSON);
+            Detector::Yolo { net, classes, people_label } => {
                 Ok(net
-                    .detect(frame, only)?
+                    .detect(frame, classes.as_deref())?
                     .into_iter()
                     .map(|c| Detection {
                         rect: c.rect,
-                        label: if *only_people { "clovek".into() } else { COCO[c.class].into() },
+                        label: if *people_label { "clovek".into() } else { COCO[c.class].into() },
                         score: Some(c.score),
                     })
                     .collect())

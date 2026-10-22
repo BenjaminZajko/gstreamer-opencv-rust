@@ -3,7 +3,7 @@
 
 use std::env;
 
-use crate::{video_io::Codec, Result};
+use crate::{roi::Crop, video_io::Codec, Result};
 
 /// Režim detekcie, vyberá sa cez `--mode`.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -81,6 +81,23 @@ pub struct LiveArgs {
     pub codec: Codec,   // kodek kamery
     pub fps: i32,       // tempo výstupného streamu
     pub bitrate: u32,   // bitrate výstupu v kbps
+    // --- počítanie prechodov cez čiaru (zapne sa voľbou --line) ---
+    pub line: Option<f64>,       // poloha zvislej čiary ako zlomok šírky záberu
+    pub line_span: (f64, f64),   // pásmo výšky čiary (zlomky výšky)
+    pub roi: Crop,               // výrez, na ktorom beží detekcia (zobrazuje sa celý záber)
+    pub detect_width: i32,       // šírka snímok na detekciu (väčšia = viac detailov)
+    pub margin: f64,             // pásmo okolo čiary v px (proti chveniu)
+    pub max_missed: u32,         // po koľkých snímkach bez nálezu sa objekt zabudne
+    pub out_dir: String,         // kam sa ukladá log prechodov
+    // --- ukotvenie čiary k scéne (pri pohybe kamery) ---
+    pub anchor: bool,                // zapnuté ukotvenie
+    pub anchor_every: u32,           // ukotvenie sa prepočíta každú N-tú snímku
+    pub anchor_features: i32,        // koľko referenčných bodov najviac hľadať
+    pub anchor_min_inliers: usize,   // minimum zhodných bodov pre spoľahlivú polohu (ORB)
+    pub anchor_points: usize,        // koľko stabilných bodov sa sleduje (0 = len ORB)
+    pub anchor_calib: usize,         // koľko aktualizácií trvá kalibrácia (výber bodov)
+    pub anchor_deadband: f64,        // mŕtve pásmo v px: čiara sa nehýbe, kým sa kamera neposunie viac
+    pub anchor_log: bool,            // zapisovať polohu čiary každú aktualizáciu do out/anchor_log.csv
 }
 
 /// Argumenty živého režimu z príkazového riadku. Zdroj sa dá zadať aj cez premennú prostredia
@@ -106,6 +123,21 @@ pub fn parse_live_args_from<I: IntoIterator<Item = String>>(
         codec: Codec::H265,
         fps: 20,
         bitrate: 4000,
+        line: None,
+        line_span: (0.0, 1.0),
+        roi: Crop::FULL,
+        detect_width: 2560,
+        margin: 12.0,
+        max_missed: 12,
+        out_dir: "out".into(),
+        anchor: true,
+        anchor_every: 2,
+        anchor_features: 1500,
+        anchor_min_inliers: 20,
+        anchor_points: 10,
+        anchor_calib: 12,
+        anchor_deadband: 1.0,
+        anchor_log: false,
     };
     let mut input = None;
     while let Some(arg) = it.next() {
@@ -142,13 +174,165 @@ pub fn parse_live_args_from<I: IntoIterator<Item = String>>(
                 }
             }
             "--bitrate" => a.bitrate = val("--bitrate")?.parse()?,
+            "--line" => {
+                let l: f64 = val("--line")?.parse()?;
+                if !(l > 0.0 && l < 1.0) {
+                    return Err("--line musí byť medzi 0 a 1 (zlomok šírky záberu)".into());
+                }
+                a.line = Some(l);
+            }
+            "--line-span" => {
+                let v = val("--line-span")?;
+                let (y0, y1) = v
+                    .split_once(',')
+                    .and_then(|(p, q)| Some((p.trim().parse::<f64>().ok()?, q.trim().parse::<f64>().ok()?)))
+                    .ok_or("--line-span: očakávam dve čísla od,do (napr. 0.52,0.85)")?;
+                if !(0.0 <= y0 && y0 < y1 && y1 <= 1.0) {
+                    return Err("--line-span: musí platiť 0 <= od < do <= 1".into());
+                }
+                a.line_span = (y0, y1);
+            }
+            "--roi" => a.roi = Crop::parse(&val("--roi")?)?,
+            "--detect-width" => a.detect_width = val("--detect-width")?.parse()?,
+            "--margin" => {
+                a.margin = val("--margin")?.parse()?;
+                if a.margin < 0.0 {
+                    return Err("--margin nesmie byť záporný".into());
+                }
+            }
+            "--max-missed" => a.max_missed = val("--max-missed")?.parse()?,
+            "--out-dir" => a.out_dir = val("--out-dir")?,
+            "--anchor" => {
+                a.anchor = match val("--anchor")?.as_str() {
+                    "on" => true,
+                    "off" => false,
+                    _ => return Err("--anchor: on alebo off".into()),
+                }
+            }
+            "--anchor-every" => {
+                a.anchor_every = val("--anchor-every")?.parse()?;
+                if a.anchor_every < 1 {
+                    return Err("--anchor-every musí byť aspoň 1".into());
+                }
+            }
+            "--anchor-features" => {
+                a.anchor_features = val("--anchor-features")?.parse()?;
+                if a.anchor_features < 100 {
+                    return Err("--anchor-features musí byť aspoň 100".into());
+                }
+            }
+            "--anchor-min-inliers" => {
+                a.anchor_min_inliers = val("--anchor-min-inliers")?.parse()?;
+                if a.anchor_min_inliers < 8 {
+                    return Err("--anchor-min-inliers musí byť aspoň 8".into());
+                }
+            }
+            "--anchor-log" => a.anchor_log = true,
+            "--anchor-points" => {
+                a.anchor_points = val("--anchor-points")?.parse()?;
+                if a.anchor_points != 0 && a.anchor_points < 6 {
+                    return Err("--anchor-points: 0 (vypnuté) alebo aspoň 6".into());
+                }
+            }
+            "--anchor-calib" => {
+                a.anchor_calib = val("--anchor-calib")?.parse()?;
+                if a.anchor_calib < 3 {
+                    return Err("--anchor-calib musí byť aspoň 3".into());
+                }
+            }
+            "--anchor-deadband" => {
+                a.anchor_deadband = val("--anchor-deadband")?.parse()?;
+                if a.anchor_deadband < 0.0 {
+                    return Err("--anchor-deadband nesmie byť záporný".into());
+                }
+            }
             _ => return Err(format!("neznámy argument: {arg}").into()),
         }
     }
     a.input = input
         .or(env_input)
         .filter(|s| !s.is_empty())
-        .ok_or("použitie: object_detect_live --input rtsp://... (alebo premenná LIVE_INPUT) [--mode people] [--port 8554] [--mount /detect] [--codec h265|h264] [--width 1280] [--conf 0.4] [--fps 20] [--bitrate 4000]")?;
+        .ok_or("použitie: object_detect_live --input rtsp://... (alebo premenná LIVE_INPUT) [--mode people] [--port 8554] [--mount /detect] [--codec h265|h264] [--width 1280] [--conf 0.4] [--fps 20] [--bitrate 4000] [--line 0.235 --line-span 0.52,0.85 --roi 0,0.52,0.47,0.33] [--anchor on|off] [--anchor-points 10]")?;
+    Ok(a)
+}
+
+/// Argumenty programu na počítanie prechodov cez čiaru (`line_count`).
+#[derive(Debug)]
+pub struct CountArgs {
+    pub input: String,
+    pub crop: Crop,       // ktorá časť záberu sa spracuje (zlomky pôvodného obrazu)
+    pub line: f64,        // poloha zvislej čiary ako zlomok šírky orezaného obrazu (0-1)
+    pub width: i32,       // šírka spracovaného obrazu v px
+    pub model: String,
+    pub conf: f32,
+    pub margin: f64,      // pásmo okolo čiary v px, ktoré sa nepočíta (proti chveniu)
+    pub max_missed: u32,  // po koľkých snímkach bez nálezu sa objekt zabudne
+    pub every: u32,       // spracuje sa každá N-tá snímka (1 = všetky; vyššie = rýchlejšie)
+    pub out_dir: String,  // kam sa uložia výsledky
+    pub name: Option<String>, // základ názvov výstupných súborov (predvolene názov videa)
+}
+
+/// Argumenty z príkazového riadku.
+pub fn parse_count_args() -> Result<CountArgs> {
+    parse_count_args_from(env::args().skip(1))
+}
+
+/// To isté z ľubovoľného zoznamu argumentov – kvôli testom.
+pub fn parse_count_args_from<I: IntoIterator<Item = String>>(args: I) -> Result<CountArgs> {
+    let mut it = args.into_iter();
+    let mut a = CountArgs {
+        input: String::new(),
+        crop: Crop::FULL,
+        line: 0.5,
+        width: 1280,
+        model: "models/yolox_s.onnx".into(),
+        conf: 0.4,
+        margin: 12.0,
+        max_missed: 12,
+        every: 1,
+        out_dir: "out".into(),
+        name: None,
+    };
+    let mut input = None;
+    while let Some(arg) = it.next() {
+        let mut val = |name: &str| it.next().ok_or_else(|| format!("{name} chýba hodnota"));
+        match arg.as_str() {
+            "--crop" => a.crop = Crop::parse(&val("--crop")?)?,
+            "--line" => {
+                a.line = val("--line")?.parse()?;
+                if !(a.line > 0.0 && a.line < 1.0) {
+                    return Err("--line musí byť medzi 0 a 1 (zlomok šírky orezaného obrazu)".into());
+                }
+            }
+            "--width" => a.width = val("--width")?.parse()?,
+            "--model" => a.model = val("--model")?,
+            "--conf" => {
+                a.conf = val("--conf")?.parse()?;
+                if !(0.0..=1.0).contains(&a.conf) {
+                    return Err("--conf musí byť medzi 0 a 1".into());
+                }
+            }
+            "--margin" => {
+                a.margin = val("--margin")?.parse()?;
+                if a.margin < 0.0 {
+                    return Err("--margin nesmie byť záporný".into());
+                }
+            }
+            "--max-missed" => a.max_missed = val("--max-missed")?.parse()?,
+            "--every" => {
+                a.every = val("--every")?.parse()?;
+                if a.every < 1 {
+                    return Err("--every musí byť aspoň 1".into());
+                }
+            }
+            "--out-dir" => a.out_dir = val("--out-dir")?,
+            "--name" => a.name = Some(val("--name")?),
+            _ if arg.starts_with("--") => return Err(format!("neznámy argument: {arg}").into()),
+            _ if input.is_none() => input = Some(arg),
+            _ => return Err(format!("neznámy argument: {arg}").into()),
+        }
+    }
+    a.input = input.ok_or("použitie: line_count <video.mp4> [--crop x,y,w,h] [--line 0.5] [--width 1280] [--conf 0.4] [--margin 12] [--every 1] [--out-dir out] [--name nazov]")?;
     Ok(a)
 }
 
@@ -288,6 +472,150 @@ mod tests {
             &["--neznamy", "1"],
         ] {
             let v: Vec<&str> = base.iter().chain(bad.iter()).copied().collect();
+            assert!(live(&v).is_err(), "{bad:?} mal zlyhať");
+        }
+    }
+
+    // ---- počítanie prechodov ----
+
+    fn count(v: &[&str]) -> Result<CountArgs> {
+        parse_count_args_from(v.iter().map(|s| s.to_string()))
+    }
+
+    #[test]
+    fn count_predvolene_hodnoty() {
+        let a = count(&["street.mp4"]).unwrap();
+        assert_eq!(a.input, "street.mp4");
+        assert_eq!(a.crop, Crop::FULL);
+        assert_eq!((a.line, a.width, a.conf, a.margin, a.max_missed), (0.5, 1280, 0.4, 12.0, 12));
+        assert_eq!(a.every, 1);
+        assert_eq!(a.out_dir, "out");
+        assert_eq!(a.name, None);
+    }
+
+    #[test]
+    fn count_vsetky_prepinace() {
+        let a = count(&[
+            "--crop", "0,0.4,0.5,0.4", "s.mp4", "--line", "0.3", "--width", "960", "--model", "m.onnx",
+            "--conf", "0.55", "--margin", "20", "--max-missed", "5", "--out-dir", "vysledky", "--name", "ulica",
+        ])
+        .unwrap();
+        assert_eq!(a.crop, Crop { x: 0.0, y: 0.4, w: 0.5, h: 0.4 });
+        assert_eq!((a.line, a.width, a.conf, a.margin, a.max_missed), (0.3, 960, 0.55, 20.0, 5));
+        assert_eq!((a.model.as_str(), a.out_dir.as_str()), ("m.onnx", "vysledky"));
+        assert_eq!(a.name.as_deref(), Some("ulica"));
+    }
+
+    #[test]
+    fn count_chybne_hodnoty() {
+        for bad in [
+            &["--line", "0"][..], &["--line", "1"], &["--line", "-0.2"], &["--line", "abc"],
+            &["--crop", "1,2,3"], &["--crop", "0,0,2,2"], &["--conf", "7"], &["--margin", "-1"],
+            &["--width"], &["--neznamy", "1"], &["--every", "0"], &["--every", "x"],
+        ] {
+            let v: Vec<&str> = ["s.mp4"].iter().chain(bad.iter()).copied().collect();
+            assert!(count(&v).is_err(), "{bad:?} mal zlyhať");
+        }
+    }
+
+    #[test]
+    fn count_chyba_bez_videa_a_druhe_video() {
+        assert!(count(&[]).unwrap_err().to_string().contains("použitie"));
+        assert!(count(&["a.mp4", "b.mp4"]).is_err());
+    }
+
+    // ---- živé počítanie ----
+
+    #[test]
+    fn live_pocitanie_je_predvolene_vypnute() {
+        let a = live(&["--input", "test:ball"]).unwrap();
+        assert_eq!(a.line, None);
+        assert_eq!(a.line_span, (0.0, 1.0));
+        assert_eq!(a.roi, Crop::FULL);
+        assert_eq!((a.detect_width, a.margin, a.max_missed, a.out_dir.as_str()), (2560, 12.0, 12, "out"));
+    }
+
+    #[test]
+    fn live_pocitanie_prepinace() {
+        let a = live(&[
+            "--input", "file:/v.mp4", "--line", "0.235", "--line-span", "0.52,0.85", "--roi", "0,0.52,0.47,0.33",
+            "--detect-width", "3000", "--margin", "20", "--max-missed", "8", "--out-dir", "logy",
+        ])
+        .unwrap();
+        assert_eq!(a.line, Some(0.235));
+        assert_eq!(a.line_span, (0.52, 0.85));
+        assert_eq!(a.roi, Crop { x: 0.0, y: 0.52, w: 0.47, h: 0.33 });
+        assert_eq!((a.detect_width, a.margin, a.max_missed, a.out_dir.as_str()), (3000, 20.0, 8, "logy"));
+    }
+
+    #[test]
+    fn live_pocitanie_chybne_hodnoty() {
+        for bad in [
+            &["--line", "0"][..], &["--line", "1"], &["--line", "x"],
+            &["--line-span", "0.5"], &["--line-span", "0.8,0.2"], &["--line-span", "0.2,1.5"], &["--line-span", "a,b"],
+            &["--roi", "0,0,2,2"], &["--roi", "1,2,3"], &["--margin", "-3"],
+        ] {
+            let v: Vec<&str> = ["--input", "test:ball"].iter().chain(bad.iter()).copied().collect();
+            assert!(live(&v).is_err(), "{bad:?} mal zlyhať");
+        }
+    }
+
+    // ---- ukotvenie ----
+
+    #[test]
+    fn ukotvenie_je_predvolene_zapnute() {
+        let a = live(&["--input", "test:ball"]).unwrap();
+        assert!(a.anchor);
+        assert_eq!((a.anchor_every, a.anchor_features, a.anchor_min_inliers), (2, 1500, 20));
+        assert_eq!((a.anchor_points, a.anchor_calib, a.anchor_deadband), (10, 12, 1.0));
+        assert!(!a.anchor_log);
+    }
+
+    #[test]
+    fn ukotvenie_log_je_prepinac_bez_hodnoty() {
+        let a = live(&["--input", "x", "--anchor-log", "--port", "9000"]).unwrap();
+        assert!(a.anchor_log);
+        assert_eq!(a.port, 9000, "argument za prepínačom sa nepovažuje za jeho hodnotu");
+    }
+
+    #[test]
+    fn ukotvenie_prepinace() {
+        let a = live(&["--input", "x", "--anchor", "off", "--anchor-every", "5", "--anchor-features", "800", "--anchor-min-inliers", "12"]).unwrap();
+        assert!(!a.anchor);
+        assert_eq!((a.anchor_every, a.anchor_features, a.anchor_min_inliers), (5, 800, 12));
+        assert!(live(&["--input", "x", "--anchor", "on"]).unwrap().anchor);
+    }
+
+    #[test]
+    fn ukotvenie_chybne_hodnoty() {
+        for bad in [
+            &["--anchor", "maybe"][..], &["--anchor-every", "0"], &["--anchor-every", "x"],
+            &["--anchor-features", "50"], &["--anchor-min-inliers", "3"], &["--anchor"],
+        ] {
+            let v: Vec<&str> = ["--input", "x"].iter().chain(bad.iter()).copied().collect();
+            assert!(live(&v).is_err(), "{bad:?} mal zlyhať");
+        }
+    }
+
+    #[test]
+    fn count_every() {
+        assert_eq!(count(&["s.mp4", "--every", "3"]).unwrap().every, 3);
+    }
+
+    #[test]
+    fn ukotvenie_stabilne_body_prepinace() {
+        let a = live(&["--input", "x", "--anchor-points", "8", "--anchor-calib", "20", "--anchor-deadband", "1.2"]).unwrap();
+        assert_eq!((a.anchor_points, a.anchor_calib, a.anchor_deadband), (8, 20, 1.2));
+        assert_eq!(live(&["--input", "x", "--anchor-points", "0"]).unwrap().anchor_points, 0, "0 = len ORB");
+    }
+
+    #[test]
+    fn ukotvenie_stabilne_body_chybne_hodnoty() {
+        for bad in [
+            &["--anchor-points", "3"][..], &["--anchor-points", "x"], &["--anchor-calib", "2"],
+            &["--anchor-deadband", "-1"], &["--anchor-deadband", "x"], &["--anchor-points"],
+        ] {
+            let v: Vec<&str> = ["--input", "x"].iter().chain(bad.iter()).copied().collect();
             assert!(live(&v).is_err(), "{bad:?} mal zlyhať");
         }
     }

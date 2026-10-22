@@ -41,6 +41,11 @@ pub struct Yolox {
 impl Yolox {
     /// Načíta ONNX model. `conf` je minimálna istota (0-1), pod ktorou sa detekcie zahodia.
     pub fn load(path: &str, conf: f32) -> Result<Self> {
+        Self::load_with_target(path, conf, dnn::DNN_TARGET_CPU)
+    }
+
+    /// To isté, ale na zvolenom cieli výpočtu (`dnn::DNN_TARGET_CPU`, `DNN_TARGET_OPENCL`...).
+    pub fn load_with_target(path: &str, conf: f32, target: i32) -> Result<Self> {
         if !Path::new(path).exists() {
             return Err(format!(
                 "model '{path}' neexistuje. Stiahni yolox_s.onnx z \
@@ -50,12 +55,12 @@ impl Yolox {
         }
         let mut net = dnn::read_net_from_onnx(path, dnn::ENGINE_CLASSIC)?; // klasický engine: rešpektuje nastavenie backendu/cieľa
         net.set_preferable_backend(dnn::DNN_BACKEND_OPENCV)?;
-        net.set_preferable_target(dnn::DNN_TARGET_CPU)?;
+        net.set_preferable_target(target)?;
         Ok(Self { net, conf })
     }
 
-    /// Nájde objekty na snímke (BGR). Ak je `only_class` zadané, vráti len túto triedu.
-    pub fn detect(&mut self, frame: &Mat, only_class: Option<usize>) -> Result<Vec<Candidate>> {
+    /// Nájde objekty na snímke (BGR). Ak je `classes` zadané, vráti len tieto triedy.
+    pub fn detect(&mut self, frame: &Mat, classes: Option<&[usize]>) -> Result<Vec<Candidate>> {
         // 1) Letterbox: zmenšenie na 640 px (zachová pomer strán) + sivý okraj vpravo a dole.
         let ratio = (INPUT as f64 / frame.rows() as f64).min(INPUT as f64 / frame.cols() as f64);
         let (nw, nh) = ((frame.cols() as f64 * ratio) as i32, (frame.rows() as f64 * ratio) as i32);
@@ -88,7 +93,7 @@ impl Yolox {
         let data = out.data_typed::<f32>()?;
 
         // 4) Dekódovanie + odfiltrovanie slabých + NMS
-        let mut cands = decode(data, ratio, self.conf, only_class);
+        let mut cands = decode(data, ratio, self.conf, classes);
         for c in &mut cands {
             c.rect = clamp(c.rect, frame.cols(), frame.rows());
         }
@@ -103,7 +108,7 @@ impl Yolox {
 ///   stred = ((x + gx) * s, (y + gy) * s),   veľkosť = (exp(w) * s, exp(h) * s)
 /// Skóre = istota_objektu * skóre_triedy. `ratio` je zmenšenie z letterboxu (súradnice sa
 /// vydelia, aby sedeli na pôvodný obraz).
-pub fn decode(data: &[f32], ratio: f64, conf: f32, only_class: Option<usize>) -> Vec<Candidate> {
+pub fn decode(data: &[f32], ratio: f64, conf: f32, classes: Option<&[usize]>) -> Vec<Candidate> {
     const COLS: usize = 85; // 4 súradnice + 1 istota + 80 tried
     let mut out = vec![];
     let mut row = 0;
@@ -125,7 +130,7 @@ pub fn decode(data: &[f32], ratio: f64, conf: f32, only_class: Option<usize>) ->
                     .enumerate()
                     .fold((0, 0.0f32), |best, (i, &s)| if s > best.1 { (i, s) } else { best });
                 let score = obj * cls_score;
-                if score < conf || only_class.is_some_and(|c| c != class) {
+                if score < conf || classes.is_some_and(|cs| !cs.contains(&class)) {
                     continue;
                 }
                 let s = stride as f32;
@@ -261,9 +266,22 @@ mod tests {
         set(&mut d, 0, [0.0, 0.0, 0.0, 0.0], 0.9, 0, 0.9); // person
         set(&mut d, 1, [0.0, 0.0, 0.0, 0.0], 0.9, 2, 0.9); // car
         assert_eq!(decode(&d, 1.0, 0.4, None).len(), 2);
-        let only = decode(&d, 1.0, 0.4, Some(0));
+        let only = decode(&d, 1.0, 0.4, Some(&[0]));
         assert_eq!(only.len(), 1);
         assert_eq!(only[0].class, 0);
+    }
+
+    #[test]
+    fn filter_viacerych_tried() {
+        let mut d = empty();
+        set(&mut d, 0, [0.0, 0.0, 0.0, 0.0], 0.9, 0, 0.9); // person
+        set(&mut d, 1, [0.0, 0.0, 0.0, 0.0], 0.9, 2, 0.9); // car
+        set(&mut d, 2, [0.0, 0.0, 0.0, 0.0], 0.9, 16, 0.9); // dog
+        let c = decode(&d, 1.0, 0.4, Some(&[0, 2]));
+        let mut classes: Vec<usize> = c.iter().map(|x| x.class).collect();
+        classes.sort();
+        assert_eq!(classes, vec![0, 2], "pes sa vyradí");
+        assert!(decode(&d, 1.0, 0.4, Some(&[])).is_empty(), "prázdny zoznam = nič");
     }
 
     #[test]

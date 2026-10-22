@@ -245,3 +245,141 @@ fn vstup_z_premennej_prostredia() {
     let _ = child.wait();
     assert!(up, "server sa s LIVE_INPUT nerozbehol");
 }
+
+// ---------------------------------------------------------------------------
+// Režim počítania (--line): celý záber vo výstupe, čiara, súbory s počtami
+// ---------------------------------------------------------------------------
+
+/// Servery s neurónovou sieťou sú náročné na CPU; testy, ktoré ich spúšťajú, bežia po jednom,
+/// inak sa pri súbežnom behu navzájom pripravia o výkon a presiahnu časový limit.
+static HEAVY: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn heavy() -> std::sync::MutexGuard<'static, ()> {
+    HEAVY.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn model_path() -> Option<String> {
+    let p = format!("{}/models/yolox_s.onnx", env!("CARGO_MANIFEST_DIR"));
+    std::path::Path::new(&p).exists().then_some(p)
+}
+
+/// Dočasný priečinok pre logy počítania.
+struct Dir(std::path::PathBuf);
+impl Dir {
+    fn new(name: &str) -> Self {
+        let p = std::env::temp_dir().join(format!("live_count_e2e_{}_{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&p);
+        Dir(p)
+    }
+    fn s(&self) -> String {
+        self.0.to_string_lossy().into_owned()
+    }
+}
+impl Drop for Dir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Prijme snímky a vráti pre každú počet žltých pixelov v danom pásme stĺpcov a riadkov.
+fn yellow_in(url: &str, want: usize, cols: std::ops::Range<usize>, rows: std::ops::Range<usize>) -> Vec<usize> {
+    gst::init().unwrap();
+    let p = gst::parse::launch(&format!(
+        "rtspsrc location={url} protocols=tcp latency=200 ! decodebin ! videoconvert \
+         ! video/x-raw,format=BGR ! appsink name=sink sync=false"
+    ))
+    .unwrap()
+    .downcast::<gst::Pipeline>()
+    .unwrap();
+    let sink = p.by_name("sink").unwrap().downcast::<gst_app::AppSink>().unwrap();
+    p.set_state(gst::State::Playing).unwrap();
+    let (mut out, start) = (vec![], Instant::now());
+    while out.len() < want && start.elapsed() < Duration::from_secs(40) {
+        let Some(s) = sink.try_pull_sample(gst::ClockTime::from_seconds(2)) else { continue };
+        let info = gst_video::VideoInfo::from_caps(s.caps().unwrap()).unwrap();
+        let map = s.buffer().unwrap().map_readable().unwrap();
+        let stride = info.stride()[0] as usize;
+        let mut n = 0;
+        for y in rows.clone().filter(|&y| y < info.height() as usize) {
+            for x in cols.clone().filter(|&x| x < info.width() as usize) {
+                let px = &map.as_slice()[y * stride + x * 3..y * stride + x * 3 + 3];
+                // BGR: žltá = málo modrej, veľa zelenej a červenej
+                if px[0] < 100 && px[1] > 190 && px[2] > 190 {
+                    n += 1;
+                }
+            }
+        }
+        out.push(n);
+    }
+    p.set_state(gst::State::Null).unwrap();
+    out
+}
+
+#[test]
+fn pocitanie_vysiela_celu_scenu_so_zltou_ciarou_len_v_pasme() {
+    let Some(model) = model_path() else { return eprintln!("model chýba – test preskočený") };
+    let _heavy = heavy();
+    let dir = Dir::new("line");
+    // test:ball je 640x360; výstup 320x180; čiara v strede (x=160), pásmo 20–80 % výšky (y=36..144)
+    let mut s = Live::start(&[
+        "--line", "0.5", "--line-span", "0.2,0.8", "--detect-width", "640",
+        "--model", &model, "--out-dir", &dir.s(),
+    ]);
+    s.wait_ready();
+    let url = s.url();
+
+    let on_line = yellow_in(&url, 25, 157..164, 36..145);
+    assert!(on_line.len() >= 25, "prišlo len {} snímok", on_line.len());
+    assert!(on_line.iter().skip(5).all(|&n| n > 50), "čiara má byť v pásme viditeľná: {on_line:?}");
+
+    let above = yellow_in(&url, 15, 157..164, 0..30);
+    let below = yellow_in(&url, 15, 157..164, 150..180);
+    assert!(above.iter().all(|&n| n == 0), "nad pásmom nemá byť čiara: {above:?}");
+    assert!(below.iter().all(|&n| n == 0), "pod pásmom nemá byť čiara: {below:?}");
+}
+
+#[test]
+fn pocitanie_vytvori_subory_s_poctami_aj_bez_divaka() {
+    let Some(model) = model_path() else { return eprintln!("model chýba – test preskočený") };
+    let _heavy = heavy();
+    let dir = Dir::new("files");
+    let mut s = Live::start(&["--line", "0.5", "--detect-width", "640", "--model", &model, "--out-dir", &dir.s()]);
+    s.wait_ready();
+    sleep(Duration::from_secs(2)); // nik sa nepozerá
+
+    let counts = std::fs::read_to_string(format!("{}/live_counts.txt", dir.s())).expect("súhrn počtov");
+    assert!(counts.contains("Autá: spolu 0") && counts.contains("Ľudia: spolu 0"), "{counts}");
+    assert!(counts.contains("Počítanie od:"), "{counts}");
+
+    let csv = std::fs::read_dir(dir.s())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .find(|e| e.file_name().to_string_lossy().ends_with("_events.csv"))
+        .expect("CSV s prechodmi");
+    let text = std::fs::read_to_string(csv.path()).unwrap();
+    assert_eq!(text.lines().next().unwrap(), "cas,track_id,skupina,smer,spolu_auta,spolu_ludia");
+    assert!(s.alive());
+}
+
+#[test]
+fn pocitanie_bez_modelu_skonci_s_napovedou() {
+    let dir = Dir::new("nomodel");
+    let out = Command::new(env!("CARGO_BIN_EXE_object_detect_live"))
+        .args(["--input", "test:ball", "--line", "0.5", "--model", "/neexistuje/m.onnx", "--out-dir", &dir.s()])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("yolox_s.onnx"));
+}
+
+#[test]
+fn zla_ciara_alebo_pasmo_skonci_pred_spustenim() {
+    for bad in [&["--line", "2"][..], &["--line", "0.5", "--line-span", "0.9,0.1"]] {
+        let out = Command::new(env!("CARGO_BIN_EXE_object_detect_live"))
+            .args(["--input", "test:ball"])
+            .args(bad)
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "{bad:?}");
+    }
+}

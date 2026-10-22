@@ -6,19 +6,43 @@ use gstreamer_app as gst_app;
 use gstreamer_video as gst_video;
 use opencv::{core, core::Mat, prelude::*};
 
-use crate::Result;
+use crate::{roi::CropPixels, Result};
+
+/// Popis vstupnej pipeline pre súbor: dekódovanie -> (voliteľné orezanie) -> BGR -> zmenšenie.
+/// `videocrop` je element GStreameru, ktorý odreže zadaný počet pixelov z každej strany.
+///
+/// Orezanie je PRED prevodom do BGR: tak sa prevádza len výrez, nie celý 4K snímok (zhruba 4x rýchlejšie).
+pub fn file_input_pipeline(path: &str, width: i32, crop: Option<CropPixels>) -> String {
+    let crop = match crop {
+        Some(c) => format!(
+            "! videocrop left={} top={} right={} bottom={} ",
+            c.left, c.top, c.right, c.bottom
+        ),
+        None => String::new(),
+    };
+    format!(
+        "filesrc location=\"{path}\" ! decodebin {crop}! videoconvert ! videoscale \
+         ! video/x-raw,format=BGR,width={width},pixel-aspect-ratio=1/1 ! appsink name=sink sync=false"
+    )
+}
 
 /// Vstupná pipeline: ľubovoľný formát -> BGR (formát, ktorý OpenCV používa), zmenšené na `width`.
 /// pixel-aspect-ratio=1/1 núti videoscale dopočítať výšku (inak by video zdeformoval).
 /// sync=false = spracúvaj čo najrýchlejšie, nečakaj na reálny čas.
 /// Vráti pipeline a appsink, z ktorého sa vyberajú snímky.
 pub fn open_input(path: &str, width: i32) -> Result<(gst::Pipeline, gst_app::AppSink)> {
-    let input = gst::parse::launch(&format!(
-        "filesrc location=\"{path}\" ! decodebin ! videoconvert ! videoscale \
-         ! video/x-raw,format=BGR,width={width},pixel-aspect-ratio=1/1 ! appsink name=sink sync=false"
-    ))?
-    .downcast::<gst::Pipeline>()
-    .map_err(|_| "pipeline")?;
+    open_input_cropped(path, width, None)
+}
+
+/// To isté, ale s orezaním záberu (pozri `roi::Crop`).
+pub fn open_input_cropped(
+    path: &str,
+    width: i32,
+    crop: Option<CropPixels>,
+) -> Result<(gst::Pipeline, gst_app::AppSink)> {
+    let input = gst::parse::launch(&file_input_pipeline(path, width, crop))?
+        .downcast::<gst::Pipeline>()
+        .map_err(|_| "pipeline")?;
     // appsink = element, z ktorého my vyberáme snímky
     let sink = input
         .by_name("sink")
@@ -27,6 +51,28 @@ pub fn open_input(path: &str, width: i32) -> Result<(gst::Pipeline, gst_app::App
         .map_err(|_| "appsink")?;
     input.set_state(gst::State::Playing)?;
     Ok((input, sink))
+}
+
+/// Zistí rozmery videa (šírka, výška) bez jeho spracovania – rozbehne pipeline po prvú snímku.
+pub fn probe_size(path: &str) -> Result<(i32, i32)> {
+    let p = gst::parse::launch(&format!(
+        "filesrc location=\"{path}\" ! decodebin ! videoconvert ! appsink name=sink sync=false"
+    ))?
+    .downcast::<gst::Pipeline>()
+    .map_err(|_| "pipeline")?;
+    let sink = p
+        .by_name("sink")
+        .ok_or("appsink")?
+        .downcast::<gst_app::AppSink>()
+        .map_err(|_| "appsink")?;
+    p.set_state(gst::State::Paused)
+        .map_err(|_| format!("video '{path}' sa nepodarilo otvoriť"))?;
+    let sample = sink
+        .try_pull_preroll(gst::ClockTime::from_seconds(15))
+        .ok_or_else(|| format!("z videa '{path}' sa nepodarilo prečítať prvú snímku"))?;
+    let info = gst_video::VideoInfo::from_caps(sample.caps().ok_or("caps")?)?;
+    p.set_state(gst::State::Null)?;
+    Ok((info.width() as i32, info.height() as i32))
 }
 
 /// Kodek videa z kamery.
@@ -38,25 +84,37 @@ pub enum Codec {
 
 /// Spoločný koniec vstupných pipeline: BGR, zmenšené na `width`, appsink ktorý zahadzuje staré
 /// snímky (max-buffers=1 drop=true), aby pri pomalšej detekcii nenarastalo oneskorenie.
-fn bgr_tail(width: i32) -> String {
+///
+/// `sync=true` sa používa pre súbory: snímky prichádzajú v reálnom tempe videa (ako z kamery).
+fn bgr_tail(width: i32, sync: bool) -> String {
     format!(
         "videoconvert ! videoscale \
          ! video/x-raw,format=BGR,width={width},pixel-aspect-ratio=1/1 \
-         ! appsink name=sink sync=false max-buffers=1 drop=true"
+         ! appsink name=sink sync={sync} max-buffers=1 drop=true"
     )
 }
 
 /// Zloží popis pipeline pre živý zdroj:
 ///   * `rtsp://...`  kamera (TCP, HW dekódovanie VideoToolbox),
-///   * `test:ball`   umelý zdroj s pohybujúcou sa loptou (na skúšanie bez kamery).
+///   * `test:ball`   umelý zdroj s pohybujúcou sa loptou (na skúšanie bez kamery),
+///   * `file:/cesta/video.mp4`  súbor prehrávaný v reálnom tempe, akoby to bola kamera.
 ///
 /// Pri H.265 z Tapo kamery sa stream musí pretočiť cez matroskamux/matroskademux, inak
 /// VideoToolbox dekóduje len kľúčové snímky (0,5 fps) – pozri tapo.sh v GStream_configuration.
 pub fn live_input_pipeline(source: &str, codec: Codec, width: i32) -> Result<String> {
-    let tail = bgr_tail(width);
+    let tail = bgr_tail(width, false);
     if source == "test:ball" {
         return Ok(format!(
             "videotestsrc is-live=true pattern=ball ! video/x-raw,width=640,height=360,framerate=20/1 ! {tail}"
+        ));
+    }
+    if let Some(path) = source.strip_prefix("file:") {
+        if path.is_empty() {
+            return Err("zdroj 'file:' potrebuje cestu, napr. file:/cesta/video.mp4".into());
+        }
+        return Ok(format!(
+            "filesrc location=\"{path}\" ! decodebin ! {}",
+            bgr_tail(width, true)
         ));
     }
     if source.starts_with("rtsp://") || source.starts_with("rtsps://") {
@@ -71,7 +129,7 @@ pub fn live_input_pipeline(source: &str, codec: Codec, width: i32) -> Result<Str
             "rtspsrc location=\"{source}\" protocols=tcp latency=200 ! {depay} ! {tail}"
         ));
     }
-    Err(format!("neznámy zdroj '{source}': použi rtsp://... alebo test:ball").into())
+    Err(format!("neznámy zdroj '{source}': použi rtsp://..., test:ball alebo file:/cesta/video.mp4").into())
 }
 
 /// Otvorí živý zdroj (pozri `live_input_pipeline`). Vráti pipeline a appsink so snímkami.
@@ -334,5 +392,41 @@ mod tests {
             let d = live_input_pipeline(src, codec, 320).unwrap();
             gst::parse::launch(&d).unwrap_or_else(|e| panic!("{d}\n{e}"));
         }
+    }
+
+    #[test]
+    fn file_pipeline_bez_orezania_nema_videocrop() {
+        let d = file_input_pipeline("/a/b.mp4", 1280, None);
+        assert!(!d.contains("videocrop"));
+        assert!(d.contains("location=\"/a/b.mp4\"") && d.contains("width=1280") && d.contains("format=BGR"));
+    }
+
+    #[test]
+    fn file_pipeline_s_orezanim_ma_videocrop_pred_zmensenim() {
+        let c = CropPixels { left: 10, top: 20, right: 30, bottom: 40 };
+        let d = file_input_pipeline("/a/b.mp4", 640, Some(c));
+        assert!(d.contains("videocrop left=10 top=20 right=30 bottom=40"), "{d}");
+        assert!(d.find("videocrop").unwrap() < d.find("videoscale").unwrap(), "orezať treba pred zmenšením");
+        assert!(d.find("videocrop").unwrap() < d.find("videoconvert").unwrap(), "orezať treba pred prevodom do BGR");
+        gst::init().unwrap();
+        gst::parse::launch(&d).unwrap();
+    }
+
+    #[test]
+    fn probe_neexistujuceho_suboru_zlyha() {
+        gst::init().unwrap();
+        assert!(probe_size("/neexistuje/video.mp4").is_err());
+    }
+
+    #[test]
+    fn live_pipeline_subor_bezi_v_realnom_case() {
+        let d = live_input_pipeline("file:/a/b.mp4", Codec::H265, 1280).unwrap();
+        assert!(d.contains("filesrc location=\"/a/b.mp4\"") && d.contains("decodebin"));
+        assert!(d.contains("sync=true"), "súbor sa má prehrávať v reálnom tempe: {d}");
+        let kamera = live_input_pipeline("rtsp://x/y", Codec::H265, 1280).unwrap();
+        assert!(kamera.contains("sync=false"), "kamera nesmie čakať na hodiny");
+        assert!(live_input_pipeline("file:", Codec::H265, 1280).is_err());
+        gst::init().unwrap();
+        gst::parse::launch(&d).unwrap();
     }
 }

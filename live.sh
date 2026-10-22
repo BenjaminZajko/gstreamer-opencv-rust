@@ -1,6 +1,8 @@
 #!/bin/bash
 # Živá detekcia z kamery cez vlastný RTSP server, beží v pozadí.
-#   ./live.sh start [prepínače]   # spustí (napr. ./live.sh start --mode objects --conf 0.5)
+#   ./live.sh count [prepínače]   # spustí POČÍTANIE áut a ľudí cez čiaru (celý záber vo VLC)
+#   ./live.sh counts              # vypíše aktuálne počty
+#   ./live.sh start [prepínače]   # spustí detekciu s rámčekmi (napr. ./live.sh start --mode objects)
 #   ./live.sh stop                # zastaví
 #   ./live.sh status              # beží? + adresa pre VLC
 #   ./live.sh logs                # sleduje log (Ctrl+C = koniec sledovania, server beží ďalej)
@@ -14,6 +16,10 @@ CAM_CONF="${CAM_CONF:-$DIR/../GStream_configuration/camera.conf}"
 STREAM="${STREAM:-stream1}"
 PORT="${PORT:-8554}"
 MOUNT="${MOUNT:-/detect}"
+# nastavenie počítania pre aktuálny záber (zlomky obrazu); dá sa prepísať premennými prostredia
+LINE="${LINE:-0.235}"           # poloha zvislej čiary (zlomok šírky záberu)
+SPAN="${SPAN:-0.52,0.85}"       # pásmo výšky, v ktorom sa počíta
+ROI="${ROI:-0,0.52,0.47,0.33}"  # výrez, na ktorom beží detekcia: x,y,w,h
 PIDFILE="$DIR/live.pid"
 LOG="$DIR/live.log"
 BIN="$DIR/target/release/object_detect_live"
@@ -23,7 +29,16 @@ running() { [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; }
 my_ip()   { ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null || echo "<ip-macu>"; }
 url()     { echo "rtsp://$(my_ip):$PORT$MOUNT"; }
 
+# "count" = "start" so zapnutým počítaním
+if [ "$1" = count ]; then
+  shift
+  set -- start --line "$LINE" --line-span "$SPAN" --roi "$ROI" "$@"
+fi
+
 case "$1" in
+  counts)
+    cat "$DIR/out/live_counts.txt" 2>/dev/null || echo "zatiaľ nič (spusti ./live.sh count)"
+    ;;
   start)
     shift
     if running; then echo "už beží (pid $(cat "$PIDFILE"))"; echo "VLC: $(url)"; exit 0; fi
@@ -52,6 +67,6 @@ case "$1" in
     tail -f "$LOG" | grep --line-buffered -v -E "objc|GLib|NSApplication"
     ;;
   *)
-    echo "použitie: $0 start [prepínače] | stop | status | logs"
+    echo "použitie: $0 count | counts | start [prepínače] | stop | status | logs"
     ;;
 esac
