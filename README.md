@@ -98,7 +98,17 @@ Prechody sa ukladajú do `out/`: `live_<čas>_events.csv` (každý prechod) a `l
 Bez kamery sa dá vyskúšať na videu v reálnom tempe: `object_detect_live --input file:/cesta/video.mp4 --line 0.235 ...`.
 Počítanie je náročné na CPU (beží stále, asi 4 jadrá).
 
-## Počítanie prechodov cez čiaru zo súboru (autá a ľudia)
+## Počítanie zo súboru s ukotvenou čiarou (`video_count`)
+To isté ako živé počítanie, ale vstupom je video a výsledok sa uloží. Celý záber, detekcia na výreze, čiara
+ukotvená k scéne – ak sa v zázname zmení uhol kamery, čiara ostane na tom istom mieste ulice.
+```bash
+./target/release/video_count video.mp4 --line 0.235 --line-span 0.52,0.85 --roi 0,0.52,0.47,0.33
+```
+Výsledky v `out/`: `<názov>_counted.mp4` (video s čiarou, rámčekmi a počtami), `<názov>_events.csv`,
+`<názov>_summary.txt` a `<názov>_reference.jpg` (vybrané referenčné body). Voľby sú rovnaké ako pri živom
+počítaní (`--conf`, `--anchor on|off`, `--width`, `--detect-width`...), navyše `--output cesta/video.mp4`.
+
+## Počítanie prechodov cez čiaru zo súboru s pevným orezaním (`line_count`)
 Z videa sa orezá zadaná časť záberu (napr. len cesta), YOLOX nájde autá a ľudí, tracker im pridelí ID
 a program počíta, koľkí prešli cez zvislú čiaru, zvlášť podľa smeru.
 ```bash
@@ -134,6 +144,6 @@ na presnosť je malý. Hlavná záťaž je samotná sieť YOLOX (~84 ms na sním
 ```bash
 cargo test --release
 ```
-Unit testy (203), testy počítania (10) a e2e testy: súbory (8), živý server a počítanie (13), `line_count` (8), ukotvenie (5). Testy s modelom sa bez neho preskočia.
+Unit testy (203), testy počítania (10) a e2e testy: súbory (8), živý server a počítanie (13), `line_count` (8), ukotvenie (5), `video_count` (5). Testy s modelom sa bez neho preskočia.
 
 Poznámka: projekt používa OpenCV 5 (crate `opencv` 0.101), kde sú niektoré funkcie v iných moduloch než v OpenCV 4.

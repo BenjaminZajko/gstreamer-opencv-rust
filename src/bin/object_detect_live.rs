@@ -22,19 +22,15 @@ use std::{
 use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_video as gst_video;
-use opencv::{
-    core::{Mat, Size},
-    imgproc,
-};
-
 use object_detect::{
-    anchor::{draw_points, rect_corners, render_reference, Anchor, AnchorConfig, AnchorMode},
+    anchor::AnchorConfig,
     args::{parse_live_args, LiveArgs},
-    counter::{CrossEvent, COUNTED_CLASSES},
+    counter::{CrossEvent, Group, LineCounter, COUNTED_CLASSES},
     detector::Detector,
     draw,
-    live_count::{detect_in_roi, roi_from_quad, roi_rect, CountingCore, Session},
+    live_count::Session,
     rtsp_out::{ensure_port_free, RtspOutput},
+    scene::{SceneConfig, SceneCounter},
     video_io, Result,
 };
 
@@ -129,9 +125,7 @@ impl CountLog {
     }
 
     /// Pripíše prechod do CSV a prepíše súhrn.
-    fn record(&self, ev: &CrossEvent, core: &CountingCore) -> Result<()> {
-        use object_detect::counter::Group;
-        let c = core.counter();
+    fn record(&self, ev: &CrossEvent, c: &LineCounter) -> Result<()> {
         let mut f = OpenOptions::new().append(true).open(&self.csv_path)?;
         writeln!(
             f,
@@ -143,15 +137,15 @@ impl CountLog {
             c.total(Group::Vehicle),
             c.total(Group::Person)
         )?;
-        self.write_counts(core)
+        self.write_counts(c)
     }
 
-    fn write_counts(&self, core: &CountingCore) -> Result<()> {
+    fn write_counts(&self, c: &LineCounter) -> Result<()> {
         let text = format!(
             "Počítanie od: {}\nPosledná zmena: {}\n\n{}",
             self.started,
             chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
-            core.counter().summary()
+            c.summary()
         );
         fs::write(&self.counts_path, text)?;
         Ok(())
@@ -160,32 +154,13 @@ impl CountLog {
 
 /// Režim počítania: celý záber vo výstupe, detekcia na výreze, stále zapnuté.
 ///
-/// Čiara a výrez sú ukotvené k scéne: pri štarte sa uloží referenčný záber a v každej ďalšej snímke
-/// sa hľadajú tie isté body (modul `anchor`). Keď sa kamera pootočí, čiara aj výrez sa posunú s ňou.
+/// Čiara a výrez sú ukotvené k scéne (modul `anchor`, pozri `scene::SceneCounter`).
 fn run_counting(args: &LiveArgs, line: f64) -> Result<()> {
-    let mut detector = Detector::yolo_with_classes(&args.model, args.conf, &COUNTED_CLASSES)?;
     let log = CountLog::new(&args.out_dir)?;
+    let cfg = scene_config(args, line);
 
     // všetko, čo závisí od rozmerov snímky, sa pripraví pri prvej snímke
-    struct Setup {
-        core: CountingCore,
-        output: RtspOutput,
-        info_out: gst_video::VideoInfo,
-        scale: f64,
-        out_size: Size,
-        /// výrez na detekciu vo veľkej snímke (keď nie je ukotvenie)
-        roi_static: opencv::core::Rect,
-        /// výrez a čiara v súradniciach referencie (= výstupný záber pri štarte)
-        roi_ref_quad: [(f64, f64); 4],
-        line_ref: ((f64, f64), (f64, f64)),
-        anchor: Option<Anchor>,
-        was_tracking: bool,
-        /// referenčný záber (farebný) na uloženie referenčnej fotky po kalibrácii
-        ref_color: Option<Mat>,
-        prev_mode: AnchorMode,
-        prev_keys: usize,
-    }
-    let mut setup: Option<Setup> = None;
+    let mut scene: Option<(SceneCounter, RtspOutput)> = None;
     // voliteľný záznam polohy čiary (na meranie stability ukotvenia)
     let mut anchor_log: Option<std::fs::File> = if args.anchor_log {
         let mut f = std::fs::File::create(format!("{}/anchor_log.csv", args.out_dir))?;
@@ -196,7 +171,7 @@ fn run_counting(args: &LiveArgs, line: f64) -> Result<()> {
     };
     // relácia diváka: panel a čísla objektov začínajú od nuly, keď sa pripojí divák
     let mut session: Option<Session> = None;
-    let (mut frames, start) = (0u64, Instant::now());
+    let start = Instant::now();
 
     loop {
         match video_io::open_live_input(&args.input, args.codec, args.detect_width) {
@@ -208,216 +183,71 @@ fn run_counting(args: &LiveArgs, line: f64) -> Result<()> {
                     let buffer = sample.buffer().ok_or("snímka bez buffera")?;
                     let info = gst_video::VideoInfo::from_caps(sample.caps().ok_or("snímka bez caps")?)?;
                     let frame_hi = video_io::buffer_to_mat(buffer, &info)?;
-                    let (hi_w, hi_h) = (info.width() as i32, info.height() as i32);
 
-                    if setup.is_none() {
-                        let out_w = args.width.min(hi_w);
-                        let out_h = ((hi_h as f64 * out_w as f64 / hi_w as f64) as i32 / 2) * 2;
-                        let size = Size::new(out_w, out_h);
-                        let scale = out_w as f64 / hi_w as f64;
-                        let info_out = gst_video::VideoInfo::builder(gst_video::VideoFormat::Bgr, out_w as u32, out_h as u32).build()?;
-                        let (y0, y1) = args.line_span;
-                        let roi_static = roi_rect(&args.roi, hi_w, hi_h);
-
-                        // referenčný záber pre ukotvenie (výstupné rozlíšenie, šedotónový)
-                        let mut ref_color = None;
-                        let anchor = if args.anchor {
-                            let mut small = Mat::default();
-                            imgproc::resize(&frame_hi, &mut small, size, 0.0, 0.0, imgproc::INTER_AREA)?;
-                            let mut gray = Mat::default();
-                            imgproc::cvt_color_def(&small, &mut gray, imgproc::COLOR_BGR2GRAY)?;
-                            let cfg = AnchorConfig {
-                                features: args.anchor_features,
-                                min_inliers: args.anchor_min_inliers,
-                                points: args.anchor_points,
-                                calib_frames: args.anchor_calib,
-                                deadband: args.anchor_deadband,
-                            };
-                            match Anchor::new(&gray, cfg) {
-                                Ok(a) => {
-                                    ref_color = Some(small);
-                                    Some(a)
-                                }
-                                Err(e) => {
-                                    eprintln!("UPOZORNENIE: ukotvenie je vypnuté: {e}");
-                                    None
-                                }
-                            }
-                        } else {
-                            None
-                        };
-
-                        let r = roi_static;
-                        let roi_ref_quad = rect_corners(
-                            r.x as f64 * scale,
-                            r.y as f64 * scale,
-                            r.width as f64 * scale,
-                            r.height as f64 * scale,
-                        );
-                        let line_x = line * out_w as f64;
-                        let s = Setup {
-                            core: CountingCore::new(line_x, (y0 * out_h as f64, y1 * out_h as f64), args.margin, args.max_missed),
-                            output: RtspOutput::start(args.port, &args.mount, &info_out, args.fps, args.bitrate)?,
-                            info_out,
-                            scale,
-                            out_size: size,
-                            roi_static,
-                            roi_ref_quad,
-                            line_ref: ((line_x, y0 * out_h as f64), (line_x, y1 * out_h as f64)),
-                            prev_mode: anchor.as_ref().map(|a| a.mode()).unwrap_or(AnchorMode::OrbOnly),
-                            prev_keys: 0,
-                            anchor,
-                            was_tracking: true,
-                            ref_color,
-                        };
+                    if scene.is_none() {
+                        let detector = Detector::yolo_with_classes(&args.model, args.conf, &COUNTED_CLASSES)?;
+                        let (sc, notes) = SceneCounter::new(detector, &cfg, &frame_hi)?;
+                        notes.iter().for_each(|n| eprintln!("{n}"));
+                        let output = RtspOutput::start(args.port, &args.mount, sc.info_out(), args.fps, args.bitrate)?;
+                        let (r, o) = (sc.roi_static(), sc.info_out());
                         println!(
                             "RTSP server beží: rtsp://<ip-tohto-macu>:{}{}  (záber {}x{}, detekcia na {}x{} px, čiara pri {:.0} % šírky, ukotvenie {})",
-                            args.port, args.mount, out_w, out_h, roi_static.width, roi_static.height, line * 100.0,
-                            if s.anchor.is_some() { "zapnuté" } else { "vypnuté" }
+                            args.port, args.mount, o.width(), o.height(), r.width, r.height, line * 100.0,
+                            if sc.anchor().is_some() { "zapnuté" } else { "vypnuté" }
                         );
                         println!("Počítanie beží stále; záznam prechodov: {}", log.csv_path);
-                        log.write_counts(&s.core)?;
-                        setup = Some(s);
+                        log.write_counts(sc.counter())?;
+                        scene = Some((sc, output));
                     }
-                    let s = setup.as_mut().unwrap();
+                    let (sc, output) = scene.as_mut().unwrap();
 
-                    // 0) ukotvenie: kde je kamera voči referencii (každú N-tú snímku)
-                    let mut out_cache: Option<Mat> = None;
-                    if let Some(a) = s.anchor.as_mut() {
-                        if frames % args.anchor_every as u64 == 0 {
-                            let mut out = Mat::default();
-                            imgproc::resize(&frame_hi, &mut out, s.out_size, 0.0, 0.0, imgproc::INTER_AREA)?;
-                            let mut gray = Mat::default();
-                            imgproc::cvt_color_def(&out, &mut gray, imgproc::COLOR_BGR2GRAY)?;
-                            let ok = a.update(&gray)?;
-                            if ok != s.was_tracking {
-                                if ok {
-                                    println!("ukotvenie obnovené ({} bodov), počítanie pokračuje", a.inliers());
-                                } else {
-                                    println!("UKOTVENIE STRATENÉ (kamera sa otočila inam?), počítanie je pozastavené");
-                                }
-                                s.was_tracking = ok;
-                            }
-                            out_cache = Some(out);
-
-                            if let Some(f) = anchor_log.as_mut() {
-                                let (t, bt) = (a.to_current(s.line_ref.0), a.to_current(s.line_ref.1));
-                                // podpis zobrazených bodov: ak sa nemení, body sa nehýbu
-                                let shown = a.points(40);
-                                let sig: f64 = shown.iter().map(|p| (p.x + p.y) as f64).sum();
-                                writeln!(
-                                    f,
-                                    "{frames},{:.2},{:?},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{},{},{},{},{:.3},{},{}",
-                                    start.elapsed().as_secs_f64(), a.mode(), a.tracking(), a.inliers(), t.0, t.1, bt.0, bt.1, sig, shown.len(),
-                                    a.keyframes(), a.active_key(), a.in_fallback(), a.motion(), a.camera_static(), a.frozen()
-                                )?;
-                            }
-
-                            // po skončení kalibrácie: uložíme referenčnú fotku s vybranými bodmi
-                            if a.mode() != s.prev_mode {
-                                if a.mode() == AnchorMode::Fine {
-                                    if let Some(rc) = &s.ref_color {
-                                        let img = render_reference(rc, a.chosen_points(), s.line_ref, &s.roi_ref_quad)?;
-                                        let path = format!("{}/anchor_reference.jpg", args.out_dir);
-                                        opencv::imgcodecs::imwrite(&path, &img, &opencv::core::Vector::new())?;
-                                        println!("ukotvenie: vybraných {} stabilných bodov, referenčná fotka: {path}", a.chosen_points().len());
-                                    }
-                                } else if a.mode() == AnchorMode::OrbOnly {
-                                    println!("UPOZORNENIE: nenašlo sa dosť stabilných bodov na jemné sledovanie, používa sa len ORB (čiara môže mierne kmitať)");
-                                }
-                                s.prev_mode = a.mode();
-                            }
-                            // kamera sa ustálila na novom mieste: nový referenčný záber s novými stabilnými bodmi
-                            if a.keyframes() > s.prev_keys {
-                                if s.prev_keys > 0 {
-                                    println!("ukotvenie: kamera sa ustálila na novom mieste, nastavený nový referenčný záber (spolu {})", a.keyframes());
-                                }
-                                s.prev_keys = a.keyframes();
-                            }
-                        }
+                    // 0) + 1) ukotvenie, detekcia na výreze, počítanie (vždy, aj keď sa nik nepozerá)
+                    let frame_idx = sc.frames();
+                    let mut step = sc.step(&frame_hi, start.elapsed().as_secs_f64())?;
+                    step.notes.iter().for_each(|n| println!("{n}"));
+                    if let Some(photo) = &step.reference_photo {
+                        let path = format!("{}/anchor_reference.jpg", args.out_dir);
+                        opencv::imgcodecs::imwrite(&path, photo, &opencv::core::Vector::new())?;
+                        println!("referenčná fotka: {path}");
                     }
-                    let tracking = s.anchor.as_ref().map(|a| a.tracking()).unwrap_or(true);
-
-                    // výrez v aktuálnej snímke (štvoruholník, ak sa kamera pootočila)
-                    let quad_cur = match &s.anchor {
-                        Some(a) => s.roi_ref_quad.map(|p| a.to_current(p)),
-                        None => s.roi_ref_quad,
-                    };
-                    let roi_hi = if s.anchor.is_some() {
-                        roi_from_quad(&quad_cur, s.scale, hi_w, hi_h)
-                    } else {
-                        s.roi_static
-                    };
-
-                    // 1) detekcia na výreze + počítanie (vždy, aj keď sa nik nepozerá; ak je poloha
-                    //    kamery stratená, počítanie stojí, aby sa nezrátalo nič nesprávne)
-                    let time_s = start.elapsed().as_secs_f64();
-                    let (items, events) = if tracking {
-                        let dets = detect_in_roi(&mut detector, &frame_hi, roi_hi, s.scale)?;
-                        match &s.anchor {
-                            Some(a) => s.core.track_and_count_with(&dets, frames, time_s, |r| a.rect_to_reference(r)),
-                            None => s.core.track_and_count(&dets, frames, time_s),
-                        }
-                    } else {
-                        (vec![], vec![])
-                    };
-                    for ev in &events {
-                        log.record(ev, &s.core)?;
+                    if let (Some(f), true, Some(a)) = (anchor_log.as_mut(), step.anchor_updated, sc.anchor()) {
+                        let line_ref = sc.line_ref();
+                        let (t, bt) = (a.to_current(line_ref.0), a.to_current(line_ref.1));
+                        // podpis zobrazených bodov: ak sa nemení, body sa nehýbu
+                        let shown = a.points(40);
+                        let sig: f64 = shown.iter().map(|p| (p.x + p.y) as f64).sum();
+                        writeln!(
+                            f,
+                            "{frame_idx},{:.2},{:?},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{},{},{},{},{:.3},{},{}",
+                            start.elapsed().as_secs_f64(), a.mode(), a.tracking(), a.inliers(), t.0, t.1, bt.0, bt.1, sig, shown.len(),
+                            a.keyframes(), a.active_key(), a.in_fallback(), a.motion(), a.camera_static(), a.frozen()
+                        )?;
+                    }
+                    for ev in &step.events {
+                        log.record(ev, sc.counter())?;
                         println!("{} {}  (autá {}, ľudia {})", ev.group.name(), ev.direction.name(),
-                            s.core.counter().total(object_detect::counter::Group::Vehicle),
-                            s.core.counter().total(object_detect::counter::Group::Person));
+                            sc.counter().total(Group::Vehicle), sc.counter().total(Group::Person));
                     }
 
                     // 2) kreslenie a vysielanie len ak sa niekto pozerá
-                    let watching = s.output.has_client();
+                    let watching = output.has_client();
                     if !watching {
                         session = None; // všetci odišli: ďalší divák začne od nuly
                     } else if session.is_none() {
-                        session = Some(Session::start(s.core.counter()));
+                        session = Some(Session::start(sc.counter()));
                     }
                     if let (true, Some(sess)) = (watching, session.as_mut()) {
-                        let items = sess.relabel(items);
-                        let mut out = match out_cache.take() {
-                            Some(o) => o,
-                            None => {
-                                let mut o = Mat::default();
-                                imgproc::resize(&frame_hi, &mut o, s.out_size, 0.0, 0.0, imgproc::INTER_AREA)?;
-                                o
-                            }
-                        };
-                        let mut view = sess.view(s.core.counter());
-                        match &s.anchor {
-                            Some(a) => {
-                                // čiara sa presunie spolu so scénou (môže byť naklonená)
-                                view.line_pts = Some((a.to_current(s.line_ref.0), a.to_current(s.line_ref.1)));
-                                if a.tracking() {
-                                    view.footer = format!("{} | REF {}", view.footer, a.status_text());
-                                } else {
-                                    view.footer = format!("{} | REF STRATENE", view.footer);
-                                    view.warning = true;
-                                }
-                                draw::draw_quad(&mut out, &quad_cur)?;
-                                draw_points(&mut out, &a.points(40))?;
-                            }
-                            None => {
-                                let q = s.roi_ref_quad;
-                                draw::draw_quad(&mut out, &q)?;
-                            }
-                        }
-                        draw::draw_counting(&mut out, &items, &view)?;
-                        s.output.push(video_io::mat_to_untimed_buffer(&out, &s.info_out)?)?;
+                        let items = sess.relabel(std::mem::take(&mut step.items));
+                        let view = sess.view(sc.counter());
+                        let out = sc.render(&frame_hi, &mut step, &items, view)?;
+                        output.push(video_io::mat_to_untimed_buffer(&out, sc.info_out())?)?;
                     }
 
-                    frames += 1;
                     window_frames += 1;
                     if window_start.elapsed() >= Duration::from_secs(30) {
                         let fps = window_frames as f64 / window_start.elapsed().as_secs_f64();
-                        let c = s.core.counter();
-                        println!(
-                            "{fps:.1} fps | autá {} | ľudia {}",
-                            c.total(object_detect::counter::Group::Vehicle),
-                            c.total(object_detect::counter::Group::Person)
-                        );
+                        let c = sc.counter();
+                        println!("{fps:.1} fps | autá {} | ľudia {}", c.total(Group::Vehicle), c.total(Group::Person));
                         (window_start, window_frames) = (Instant::now(), 0);
                     }
                 }
@@ -427,5 +257,25 @@ fn run_counting(args: &LiveArgs, line: f64) -> Result<()> {
             Err(e) => eprintln!("zdroj sa nepodarilo otvoriť ({e})"),
         }
         retry_pause();
+    }
+}
+
+/// Nastavenie počítania z argumentov.
+fn scene_config(args: &LiveArgs, line: f64) -> SceneConfig {
+    SceneConfig {
+        line,
+        line_span: args.line_span,
+        roi: args.roi,
+        out_width: args.width,
+        margin: args.margin,
+        max_missed: args.max_missed,
+        anchor: args.anchor.then_some(AnchorConfig {
+            features: args.anchor_features,
+            min_inliers: args.anchor_min_inliers,
+            points: args.anchor_points,
+            calib_frames: args.anchor_calib,
+            deadband: args.anchor_deadband,
+        }),
+        anchor_every: args.anchor_every,
     }
 }

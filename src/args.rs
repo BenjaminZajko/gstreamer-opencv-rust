@@ -98,6 +98,7 @@ pub struct LiveArgs {
     pub anchor_calib: usize,         // koľko aktualizácií trvá kalibrácia (výber bodov)
     pub anchor_deadband: f64,        // mŕtve pásmo v px: čiara sa nehýbe, kým sa kamera neposunie viac
     pub anchor_log: bool,            // zapisovať polohu čiary každú aktualizáciu do out/anchor_log.csv
+    pub output: Option<String>,      // video_count: kam uložiť výsledné video
 }
 
 /// Argumenty živého režimu z príkazového riadku. Zdroj sa dá zadať aj cez premennú prostredia
@@ -138,6 +139,7 @@ pub fn parse_live_args_from<I: IntoIterator<Item = String>>(
         anchor_calib: 12,
         anchor_deadband: 1.0,
         anchor_log: false,
+        output: None,
     };
     let mut input = None;
     while let Some(arg) = it.next() {
@@ -228,6 +230,7 @@ pub fn parse_live_args_from<I: IntoIterator<Item = String>>(
                 }
             }
             "--anchor-log" => a.anchor_log = true,
+            "--output" => a.output = Some(val("--output")?),
             "--anchor-points" => {
                 a.anchor_points = val("--anchor-points")?.parse()?;
                 if a.anchor_points != 0 && a.anchor_points < 6 {
@@ -569,6 +572,13 @@ mod tests {
         assert_eq!((a.anchor_every, a.anchor_features, a.anchor_min_inliers), (2, 1500, 20));
         assert_eq!((a.anchor_points, a.anchor_calib, a.anchor_deadband), (10, 12, 1.0));
         assert!(!a.anchor_log);
+        assert_eq!(a.output, None);
+    }
+
+    #[test]
+    fn live_output() {
+        assert_eq!(live(&["--input", "x", "--output", "v.mp4"]).unwrap().output.as_deref(), Some("v.mp4"));
+        assert!(live(&["--input", "x", "--output"]).is_err());
     }
 
     #[test]

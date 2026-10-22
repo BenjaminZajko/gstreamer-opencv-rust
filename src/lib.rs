@@ -12,6 +12,7 @@
 //!   tracker   sledovanie objektov medzi snímkami (ID)
 //!   counter   počítanie prechodov cez zvislú čiaru
 //!   rtsp_out  vlastný RTSP server s anotovaným videom (live)
+//!   scene     počítanie na celom zábere s ukotvenou čiarou (live aj súbor)
 //!   yolox     neurónová sieť YOLOX cez OpenCV DNN
 //!   video_io  GStreamer vstup/výstup a prevod snímok GStreamer <-> OpenCV
 
@@ -24,6 +25,7 @@ pub mod labels;
 pub mod live_count;
 pub mod roi;
 pub mod rtsp_out;
+pub mod scene;
 pub mod tracker;
 pub mod video_io;
 pub mod yolox;
