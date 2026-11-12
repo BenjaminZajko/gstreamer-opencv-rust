@@ -65,6 +65,8 @@ pub struct Step {
     pub quad: [(f64, f64); 4],
     /// zmenšená snímka, ak už vznikla (aby sa nerobila dvakrát)
     out_cache: Option<Mat>,
+    /// objekty, ktoré v tejto snímke zanikli (pre históriu)
+    pub ended: Vec<u32>,
 }
 
 /// Počítadlo na celom zábere.
@@ -157,6 +159,11 @@ impl SceneCounter {
             frames: 0,
         };
         Ok((sc, notes))
+    }
+
+    /// Rozmer zobrazeného záberu (v ňom sú rámčeky objektov).
+    pub fn out_size(&self) -> Size {
+        self.out_size
     }
 
     pub fn info_out(&self) -> &gst_video::VideoInfo {
@@ -264,7 +271,8 @@ impl SceneCounter {
             (vec![], vec![])
         };
         self.frames += 1;
-        Ok(Step { items, events, notes, reference_photo, anchor_updated, quad, out_cache })
+        let ended = if tracking { self.core.ended().to_vec() } else { vec![] };
+        Ok(Step { items, events, notes, reference_photo, anchor_updated, quad, out_cache, ended })
     }
 
     /// Nakreslí celý záber: výrez, referenčné body, čiaru (ukotvenú) a panel s počtami z `view`.

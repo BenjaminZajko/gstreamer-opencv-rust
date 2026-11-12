@@ -58,6 +58,8 @@ pub struct CountingCore {
     motion: HashMap<u32, (f64, (f64, f64), bool, u32)>,
     /// prísnejšie kreslenie (pozri `with_strict_display`)
     strict: bool,
+    /// objekty, ktoré zanikli v poslednej snímke (pre históriu)
+    ended: Vec<u32>,
 }
 
 impl CountingCore {
@@ -72,7 +74,13 @@ impl CountingCore {
             last_items: HashMap::new(),
             motion: HashMap::new(),
             strict: false,
+            ended: vec![],
         }
+    }
+
+    /// Objekty, ktoré zanikli pri poslednom volaní `track_and_count*`.
+    pub fn ended(&self) -> &[u32] {
+        &self.ended
     }
 
     /// Prísnejšie kreslenie pre živý obraz: objekt až po MIN_HITS detekciách a "človek" až keď
@@ -253,6 +261,7 @@ impl CountingCore {
                 }
             }
         }
+        self.ended = update.ended.clone();
         for id in &update.ended {
             self.last_items.remove(id);
             self.motion.remove(id);

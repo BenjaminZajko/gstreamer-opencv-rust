@@ -29,6 +29,7 @@ else
   DEWARP=""
   ROI="${ROI:-0,0.5,1,0.35}"    # výrez, na ktorom beží detekcia: x,y,w,h (pás s ulicou)
 fi
+HISTORY="${HISTORY:-1}"         # 1 = história objektov: JPG každého objektu + out/objekty/historia.csv
 CLEAN="${CLEAN:-1}"             # 1 = v obraze len autá a ľudia s rýchlosťou (bez čiary, panelu, bodov)
 CONF="${CONF:-0.25}"            # minimálna istota detekcie (nižšie = menej blikania, viac objektov)
 ENGINE="${ENGINE:-coreml}"      # na čom beží sieť: coreml (GPU, ~4x rýchlejšie) alebo opencv (CPU)
@@ -50,6 +51,7 @@ if [ "$1" = count ]; then
   [ -f "$SPEED_MODEL" ] && set -- "$@" --speed "$SPEED_MODEL"
   [ -n "$DEWARP" ] && set -- "$@" --dewarp "$DEWARP"
   [ "$CLEAN" = 1 ] && set -- "$@" --clean
+  [ "$HISTORY" = 1 ] && set -- "$@" --history
 fi
 
 case "$1" in

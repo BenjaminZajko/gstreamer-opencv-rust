@@ -103,6 +103,7 @@ pub struct LiveArgs {
     pub speed_model: Option<String>, // model kamery (calib/camera_model.json) = zapnuté meranie rýchlosti
     pub dewarp: Option<String>,      // rovný obraz bez fisheye (calib/dewarp/dewarp.json)
     pub clean: bool,                 // čistý obraz: len autá a ľudia s rýchlosťou (bez čiary, panelu, bodov)
+    pub history: bool,               // história objektov: JPG každého objektu + historia.csv (out/objekty)
 }
 
 /// Argumenty živého režimu z príkazového riadku. Zdroj sa dá zadať aj cez premennú prostredia
@@ -148,6 +149,7 @@ pub fn parse_live_args_from<I: IntoIterator<Item = String>>(
         speed_model: None,
         dewarp: None,
         clean: false,
+        history: false,
     };
     let mut input = None;
     while let Some(arg) = it.next() {
@@ -243,6 +245,7 @@ pub fn parse_live_args_from<I: IntoIterator<Item = String>>(
             "--speed" => a.speed_model = Some(val("--speed")?),
             "--dewarp" => a.dewarp = Some(val("--dewarp")?),
             "--clean" => a.clean = true,
+            "--history" => a.history = true,
             "--anchor-points" => {
                 a.anchor_points = val("--anchor-points")?.parse()?;
                 if a.anchor_points != 0 && a.anchor_points < 6 {
@@ -267,7 +270,7 @@ pub fn parse_live_args_from<I: IntoIterator<Item = String>>(
     a.input = input
         .or(env_input)
         .filter(|s| !s.is_empty())
-        .ok_or("použitie: object_detect_live --input rtsp://... (alebo premenná LIVE_INPUT) [--mode people] [--port 8554] [--mount /detect] [--codec h265|h264] [--width 1280] [--conf 0.4] [--fps 20] [--bitrate 4000] [--line 0.235 --line-span 0.52,0.85 --roi 0,0.52,0.47,0.33] [--anchor on|off] [--anchor-points 10] [--speed calib/camera_model.json] [--dewarp calib/dewarp/dewarp.json] [--clean]")?;
+        .ok_or("použitie: object_detect_live --input rtsp://... (alebo premenná LIVE_INPUT) [--mode people] [--port 8554] [--mount /detect] [--codec h265|h264] [--width 1280] [--conf 0.4] [--fps 20] [--bitrate 4000] [--line 0.235 --line-span 0.52,0.85 --roi 0,0.52,0.47,0.33] [--anchor on|off] [--anchor-points 10] [--speed calib/camera_model.json] [--dewarp calib/dewarp/dewarp.json] [--clean] [--history]")?;
     Ok(a)
 }
 
@@ -613,6 +616,8 @@ mod tests {
         assert_eq!(a.dewarp.as_deref(), Some("calib/dewarp/dewarp.json"));
         assert!(a.clean);
         assert!(live(&["--input", "x", "--dewarp"]).is_err());
+        assert!(!live(&["--input", "x"]).unwrap().history);
+        assert!(live(&["--input", "x", "--history"]).unwrap().history);
     }
 
     #[test]

@@ -23,6 +23,7 @@ use object_detect::{
     scene::{SceneConfig, SceneCounter},
     speed::GroundModel,
     dewarp::{DewarpParams, LazyDewarp},
+    history::{Clock, ObjectLog},
     video_io, Result,
 };
 
@@ -33,7 +34,7 @@ fn main() -> Result<()> {
         raw.insert(0, "--input".into());
     }
     let args = parse_live_args_from(raw, None).map_err(|e| {
-        format!("{e}\npoužitie: video_count <video.mp4> [--line 0.5] [--line-span od,do] [--roi x,y,w,h] [--anchor on|off] [--engine opencv|ort-cpu|coreml|coreml-gpu|coreml-ane] [--conf 0.4] [--speed calib/camera_model.json] [--dewarp calib/dewarp/dewarp.json] [--clean] [--out-dir out] [--output video.mp4]")
+        format!("{e}\npoužitie: video_count <video.mp4> [--line 0.5] [--line-span od,do] [--roi x,y,w,h] [--anchor on|off] [--engine opencv|ort-cpu|coreml|coreml-gpu|coreml-ane] [--conf 0.4] [--speed calib/camera_model.json] [--dewarp calib/dewarp/dewarp.json] [--clean] [--history] [--out-dir out] [--output video.mp4]")
     })?;
     gst::init()?;
 
@@ -71,6 +72,9 @@ fn main() -> Result<()> {
     let mut dewarp = args.dewarp.as_deref().map(DewarpParams::load).transpose()?.map(LazyDewarp::new);
     let mut output = None;
     let mut clock = object_detect::speed::FrameClock::new();
+    // história objektov: JPG každého objektu + historia.csv
+    let objects_dir = format!("{}/{name}_objekty", args.out_dir);
+    let mut history = args.history.then(|| ObjectLog::new(&objects_dir, &format!("{name}_"), Clock::Video)).transpose()?;
     // výstupný formát: rozmery zobrazeného záberu, snímková frekvencia z pôvodného videa
     let mut info_file: Option<gst_video::VideoInfo> = None;
     let start = Instant::now();
@@ -123,6 +127,12 @@ fn main() -> Result<()> {
             );
         }
 
+        if let Some(h) = history.as_mut() {
+            h.observe(&frame_hi, sc.out_size(), &step.items, time_s)?;
+            step.events.iter().for_each(|ev| h.record_cross(ev));
+            h.finish(&step.ended, time_s)?;
+        }
+
         let items = std::mem::take(&mut step.items);
         let view = sc.counter().view().with_footer(format!("{time_s:.1} s"));
         let out = sc.render(&frame_hi, &mut step, &items, view)?;
@@ -155,5 +165,9 @@ fn main() -> Result<()> {
     fs::write(format!("{}/{name}_summary.txt", args.out_dir), &summary)?;
     println!("\n{summary}");
     println!("Uložené: {video_path}, {}/{name}_events.csv, {}/{name}_summary.txt", args.out_dir, args.out_dir);
+    if let Some(mut h) = history {
+        h.finish_all()?;
+        println!("História objektov: {} obrázkov a historia.csv v {objects_dir}", h.saved());
+    }
     Ok(())
 }

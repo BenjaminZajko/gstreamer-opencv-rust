@@ -22,6 +22,7 @@ pub mod counter;
 pub mod detector;
 pub mod dewarp;
 pub mod draw;
+pub mod history;
 pub mod labels;
 pub mod live_count;
 pub mod roi;

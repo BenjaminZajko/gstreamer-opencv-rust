@@ -28,6 +28,7 @@ use object_detect::{
     counter::{CrossEvent, Group, LineCounter, COUNTED_CLASSES},
     detector::Detector,
     dewarp::{DewarpParams, LazyDewarp},
+    history::{Clock, ObjectLog},
     draw,
     live_count::Session,
     rtsp_out::{ensure_port_free, RtspOutput},
@@ -176,6 +177,8 @@ fn run_counting(args: &LiveArgs, line: f64) -> Result<()> {
     let mut session: Option<Session> = None;
     let start = Instant::now();
     let mut dewarp = args.dewarp.as_deref().map(DewarpParams::load).transpose()?.map(LazyDewarp::new);
+    // história objektov: JPG každého objektu + historia.csv (out/objekty)
+    let mut history = args.history.then(|| ObjectLog::new(&format!("{}/objekty", args.out_dir), "", Clock::Wall)).transpose()?;
 
     loop {
         match video_io::open_live_input(&args.input, args.codec, args.detect_width) {
@@ -257,6 +260,15 @@ fn run_counting(args: &LiveArgs, line: f64) -> Result<()> {
                         log.record(ev, sc.counter())?;
                         println!("{} {}{}  (autá {}, ľudia {})", ev.group.name(), ev.direction.name(), ev.speed_text(),
                             sc.counter().total(Group::Vehicle), sc.counter().total(Group::Person));
+                    }
+
+                    if let Some(h) = history.as_mut() {
+                        h.observe(&frame_hi, sc.out_size(), &step.items, time_s)?;
+                        step.events.iter().for_each(|ev| h.record_cross(ev));
+                        for s in h.finish(&step.ended, time_s)? {
+                            let v = s.speed_kmh.map(|v| format!(" {v:.0} km/h")).unwrap_or_default();
+                            println!("objekt: {} #{}{v} -> {}", s.label, s.id, s.image);
+                        }
                     }
 
                     // 2) kreslenie a vysielanie len ak sa niekto pozerá

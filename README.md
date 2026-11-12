@@ -160,6 +160,14 @@ z dlhšieho okna (2,4 s) a skoky rámčeka sa pri výpočte vynechajú. Popisy s
 Kúsky jedného vozidla z rôznych častí výrezu sa spájajú aj keď ich sieť nazve inak (bus/truck) a menšie rámčeky
 vnútri väčšieho vozidla (okná autobusu ako „car“) sa zahodia.
 
+**História objektov (`--history`, v `live.sh` zapnutá):** pre každý objekt (auto, motorka, človek) sa po jeho
+odchode zo záberu uloží jeden JPG – najlepší záber (celý v obraze, čo najväčší) so zvýrazneným rámčekom a okienkom
+vľavo hore (typ, číslo, rýchlosť, smer, čas) – a riadok do `historia.csv` (typ, začiatok, koniec, smer, rýchlosť pri
+čiare, medián a maximum rýchlosti, názov obrázka). Živý server ukladá do `out/objekty/`, `video_count` do
+`out/<video>_objekty/`. Stopa prerušená zakrytím (oblúk, strom) sa spojí do jedného objektu; stojace objekty a
+omyly (kratšie než 0,5 s alebo bez pohybu) sa neukladajú. Vypnutie: `HISTORY=0 ./live.sh count`.
+Jeden obrázok má ~100–150 kB.
+
 Časy snímok: kamera posiela snímky v zhlukoch s rovnakou časovou značkou; časy sa vyhladia (`FrameClock`),
 inak by rýchlosť pri zhluku vyskočila.
 
@@ -248,6 +256,6 @@ na presnosť je malý. Hlavná záťaž je samotná sieť YOLOX (~84 ms na sním
 ```bash
 cargo test --release
 ```
-Unit testy (262), testy počítania (10) a e2e testy: súbory (8), živý server a počítanie (13), `line_count` (8), ukotvenie (5), `video_count` (5). Testy s modelom sa bez neho preskočia.
+Unit testy (266), testy počítania (10) a e2e testy: súbory (8), živý server a počítanie (13), `line_count` (8), ukotvenie (5), `video_count` (5). Testy s modelom sa bez neho preskočia.
 
 Poznámka: projekt používa OpenCV 5 (crate `opencv` 0.101), kde sú niektoré funkcie v iných moduloch než v OpenCV 4.
