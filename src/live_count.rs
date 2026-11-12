@@ -415,7 +415,7 @@ pub fn detect_in_roi(detector: &mut Detector, frame_hi: &Mat, roi: Rect, scale: 
             all.push(TileDet { det: Detection { rect: to_output_coords(d.rect, *tile, scale), ..d }, cut_left, cut_right });
         }
     }
-    Ok(merge_riders(merge_tiles(all)))
+    Ok(drop_occupants(merge_riders(merge_tiles(all))))
 }
 
 /// Jazdec na motorke / mopede: sieť nájde "person" aj "motorcycle" – to je jeden objekt.
@@ -471,6 +471,22 @@ pub fn merge_riders(dets: Vec<Detection>) -> Vec<Detection> {
         }
     }
     out
+}
+
+/// Ľudia vo vnútri auta / dodávky / autobusu (vodič, spolujazdci za oknom): rámček človeka
+/// leží z väčšej časti v rámčeku vozidla – to nie je chodec, vynechá sa.
+pub fn drop_occupants(dets: Vec<Detection>) -> Vec<Detection> {
+    let cars: Vec<Rect> = dets
+        .iter()
+        .filter(|d| matches!(d.label.as_str(), "car" | "truck" | "bus"))
+        .map(|d| d.rect)
+        .collect();
+    dets.into_iter()
+        .filter(|d| {
+            d.label != "person"
+                || !cars.iter().any(|c| (*c & d.rect).area() as f64 >= 0.7 * d.rect.area().max(1) as f64)
+        })
+        .collect()
 }
 
 /// Ako blízko okraja časti (px) sa rámček považuje za odrezaný.
@@ -676,6 +692,17 @@ mod tests {
                 assert!(items.iter().any(|it| it.group == Group::Person), "snímka {f}");
             }
         }
+    }
+
+    #[test]
+    fn vodic_v_aute_nie_je_chodec() {
+        let d = |label: &str, x, y, w, h| Detection { rect: Rect::new(x, y, w, h), label: label.into(), score: Some(0.8) };
+        let out = drop_occupants(vec![d("truck", 100, 100, 400, 150), d("person", 260, 120, 30, 40), d("person", 600, 100, 40, 110)]);
+        assert_eq!(out.len(), 2);
+        assert!(out.iter().any(|o| o.label == "person" && o.rect.x == 600), "chodec mimo auta ostane");
+        // človek pred autom (prekrýva sa len trochu) ostane
+        let out = drop_occupants(vec![d("car", 100, 100, 300, 120), d("person", 380, 60, 50, 150)]);
+        assert_eq!(out.len(), 2);
     }
 
     #[test]
