@@ -19,14 +19,45 @@ use crate::{
     detector::{Detection, Detector},
     draw::Counted,
     roi::Crop,
+    speed::{GroundMapper, SpeedTracker, WINDOW_S},
     tracker::Tracker,
     Result,
 };
+
+/// Koľko snímok sa objekt ešte kreslí na poslednom mieste, keď ho detektor na chvíľu nenájde
+/// (aby rámček neblikal). Pri 20 fps je to 0,4 s.
+pub const COAST_FRAMES: u32 = 8;
+
+/// Autá sa berú až od tejto istoty, aj keď je `--conf` nižšie (ľudia sú malí a potrebujú nižší
+/// prah, autá sú veľké; pri nízkom prahu sieť občas označí oblúk alebo plot s autom za ním ako
+/// jedno veľké auto).
+pub const VEHICLE_MIN_CONF: f32 = 0.4;
+
+/// "Vozidlo", ktoré sa od objavenia ani raz nepohlo, sa po tomto čase (s) prestane kresliť:
+/// sú to najmä omyly siete (elektrická skrinka ako "truck") a autá zaparkované od začiatku.
+/// Auto, ktoré prišlo a zastavilo, sa kreslí ďalej (pohlo sa).
+pub const STATIC_HIDE_S: f64 = 2.0;
+
+/// Objekt sa kreslí až po toľkých detekciách (odfiltruje jednorazové omyly siete, napr. "auto"
+/// na kúsku autobusu v jednej snímke).
+pub const MIN_HITS: u32 = 3;
 
 /// Sledovanie + počítanie (čistá logika bez videa a modelu – dobre sa testuje).
 pub struct CountingCore {
     tracker: Tracker,
     counter: LineCounter,
+    /// meranie rýchlosti (len ak je zadaný model kamery)
+    speed: Option<(GroundMapper, SpeedTracker)>,
+    /// záznam polôh objektov (CSV riadky), ak je zapnutý – na neskoršiu analýzu rýchlosti
+    track_log: Option<String>,
+    /// prechody, ktorým sa ešte dopočítava rýchlosť: (poradie v udalostiach, ID objektu, do kedy)
+    pending: Vec<(usize, u32, f64)>,
+    /// posledný vykreslený stav každého objektu (na kreslenie, keď sa na chvíľu stratí)
+    last_items: HashMap<u32, Counted>,
+    /// pohyb objektov: (čas objavenia, prvý stred v referencii, pohol sa už?, počet detekcií)
+    motion: HashMap<u32, (f64, (f64, f64), bool, u32)>,
+    /// prísnejšie kreslenie (pozri `with_strict_display`)
+    strict: bool,
 }
 
 impl CountingCore {
@@ -35,7 +66,36 @@ impl CountingCore {
         Self {
             tracker: Tracker::new(max_missed),
             counter: LineCounter::new(line_x, margin).with_span(span.0, span.1),
+            speed: None,
+            track_log: None,
+            pending: vec![],
+            last_items: HashMap::new(),
+            motion: HashMap::new(),
+            strict: false,
         }
+    }
+
+    /// Prísnejšie kreslenie pre živý obraz: objekt až po MIN_HITS detekciách a "človek" až keď
+    /// sa pohne. Počítanie a meranie to nemení.
+    pub fn with_strict_display(mut self) -> Self {
+        self.strict = true;
+        self
+    }
+
+    /// Zapne záznam polôh sledovaných objektov (každá snímka, každý objekt).
+    pub fn enable_track_log(&mut self) {
+        self.track_log = Some(String::from("frame,time_s,track_id,group,x,y,w,h,foot_u,foot_v,ground_x,ground_y,speed_kmh\n"));
+    }
+
+    /// Záznam polôh ako CSV (x,y,w,h v súradniciach referencie; foot_u/v v px snímky z merania).
+    pub fn track_log_csv(&self) -> Option<&str> {
+        self.track_log.as_deref()
+    }
+
+    /// Zapne meranie rýchlosti: `mapper` prevádza súradnice sledovania na metre na zemi.
+    pub fn with_speed(mut self, mapper: GroundMapper) -> Self {
+        self.speed = Some((mapper, SpeedTracker::new()));
+        self
     }
 
     pub fn counter(&self) -> &LineCounter {
@@ -66,6 +126,7 @@ impl CountingCore {
         let counted: Vec<_> = dets
             .iter()
             .filter_map(|d| group_of(&d.label).map(|g| (d, g)))
+            .filter(|(d, g)| *g != Group::Vehicle || d.score.is_none_or(|s| s >= VEHICLE_MIN_CONF))
             .map(|(d, g)| (d, g, to_ref(d.rect)))
             .collect();
         let update = self.tracker.update(&counted.iter().map(|(_, g, r)| (*r, *g)).collect::<Vec<_>>());
@@ -74,13 +135,104 @@ impl CountingCore {
         for ((d, group, rref), id) in counted.into_iter().zip(update.ids) {
             let cx = rref.x as f64 + rref.width as f64 / 2.0;
             let cy = rref.y as f64 + rref.height as f64 / 2.0;
-            if let Some(ev) = self.counter.observe_xy(frame_idx, time_s, id, group, cx, cy) {
-                events.push(ev);
+            // pohol sa objekt od objavenia aspoň o polovicu svojej šírky?
+            let m = self.motion.entry(id).or_insert((time_s, (cx, cy), false, 0));
+            m.3 += 1;
+            if !m.2 && ((cx - m.1.0).powi(2) + (cy - m.1.1).powi(2)).sqrt() > 0.5 * rref.width.max(10) as f64 {
+                m.2 = true;
             }
-            items.push(Counted { rect: d.rect, label: d.label.clone(), score: d.score, id, group });
+            // rýchlosť z polohy na zemi pod objektom (spodok rámčeka v referenčných súradniciach)
+            // (ľavý aj pravý okraj, pozri SpeedTracker)
+            let speed_kmh = self.speed.as_mut().and_then(|(mapper, st)| {
+                let (l, r) = mapper.foot_edges(rref.x as f64, rref.y as f64, rref.width as f64, rref.height as f64)?;
+                st.observe_box(id, time_s, l, r, rref.height as f64)
+            });
+            // prechod tohto objektu ešte čaká na rýchlosť: spresníme ju
+            if speed_kmh.is_some() {
+                for &(idx, pid, _) in &self.pending {
+                    if pid == id {
+                        self.counter.set_event_speed(idx, speed_kmh);
+                    }
+                }
+            }
+            if let Some(log) = self.track_log.as_mut() {
+                let (fu, fv, g) = match &self.speed {
+                    Some((m, _)) => {
+                        let (u, v) = m.foot_px(rref.x as f64, rref.y as f64, rref.width as f64, rref.height as f64);
+                        (format!("{u:.1}"), format!("{v:.1}"), m.foot(rref.x as f64, rref.y as f64, rref.width as f64, rref.height as f64))
+                    }
+                    None => (String::new(), String::new(), None),
+                };
+                let (gx, gy) = g.map(|g| (format!("{:.3}", g.0), format!("{:.3}", g.1))).unwrap_or_default();
+                let sp = speed_kmh.map(|v| format!("{v:.2}")).unwrap_or_default();
+                *log += &format!(
+                    "{frame_idx},{time_s:.3},{id},{},{},{},{},{},{fu},{fv},{gx},{gy},{sp}\n",
+                    group.name(), rref.x, rref.y, rref.width, rref.height
+                );
+            }
+            if let Some(mut ev) = self.counter.observe_xy(frame_idx, time_s, id, group, cx, cy) {
+                self.counter.set_last_speed(speed_kmh);
+                ev.speed_kmh = speed_kmh;
+                if self.speed.is_some() {
+                    // rýchlosť sa ešte pol okna spresňuje (aby bola z obdobia okolo čiary, nie len
+                    // pred ňou); udalosť sa vráti, keď je hotová
+                    self.pending.push((self.counter.events().len() - 1, id, time_s + WINDOW_S / 2.0));
+                } else {
+                    events.push(ev);
+                }
+            }
+            items.push(Counted { rect: d.rect, label: d.label.clone(), score: d.score, id, group, speed_kmh });
         }
+        // objekty, ktoré detektor v tejto snímke nenašiel, ale tracker ich ešte drží:
+        // nakreslia sa na poslednom mieste (rámček neseká), najviac COAST_FRAMES snímok
+        for it in &items {
+            self.last_items.insert(it.id, it.clone());
+        }
+        for t in self.tracker.tracks() {
+            if t.missed > 0 && t.missed <= COAST_FRAMES {
+                if let Some(it) = self.last_items.get(&t.id) {
+                    // posunie sa tam, kam sa objekt mal medzitým dostať (napr. za oblúkom)
+                    let mut it = it.clone();
+                    it.rect.x += (t.vel.0 * t.missed as f64).round() as i32;
+                    it.rect.y += (t.vel.1 * t.missed as f64).round() as i32;
+                    items.push(it);
+                }
+            }
+        }
+        for id in &update.ended {
+            self.last_items.remove(id);
+            self.motion.remove(id);
+        }
+        // čo sa nekreslí (počítanie tým nie je dotknuté):
+        //  - objekt nájdený menej než MIN_HITS-krát (jednorazové omyly siete),
+        //  - "vozidlo", ktoré sa od objavenia nepohlo (pozri STATIC_HIDE_S),
+        //  - "človek", ktorý sa ešte nepohol (ozdoby brány, socha, skrinka...).
+        //  (prvé a tretie len pri `with_strict_display`)
+        let (motion, strict) = (&self.motion, self.strict);
+        items.retain(|it| {
+            motion.get(&it.id).is_none_or(|&(t0, _, moved, hits)| {
+                (!strict || hits >= MIN_HITS)
+                    && match it.group {
+                        Group::Vehicle => moved || time_s - t0 < STATIC_HIDE_S,
+                        Group::Person => moved || !strict,
+                    }
+            })
+        });
+
+        // hotové prechody: uplynul čas alebo objekt zmizol
+        let counter = &self.counter;
+        self.pending.retain(|&(idx, pid, until)| {
+            let done = time_s >= until || update.ended.contains(&pid);
+            if done {
+                events.push(counter.events()[idx].clone());
+            }
+            !done
+        });
         for id in update.ended {
             self.counter.forget(id);
+            if let Some((_, st)) = self.speed.as_mut() {
+                st.forget(id);
+            }
         }
         (items, events)
     }
@@ -188,13 +340,112 @@ pub fn to_output_coords(r: Rect, roi: Rect, scale: f64) -> Rect {
 
 /// Spustí detektor len na výreze veľkej snímky a vráti detekcie v súradniciach výstupu.
 pub fn detect_in_roi(detector: &mut Detector, frame_hi: &Mat, roi: Rect, scale: f64) -> Result<Vec<Detection>> {
-    // výrez sa skopíruje (asi 1,7 MB), aby bol súvislý v pamäti
-    let view = Mat::roi(frame_hi, roi)?.try_clone()?;
-    Ok(detector
-        .detect(&view)?
-        .into_iter()
-        .map(|d| Detection { rect: to_output_coords(d.rect, roi, scale), ..d })
-        .collect())
+    let parts = tiles(roi);
+    let mut all = vec![];
+    for (i, tile) in parts.iter().enumerate() {
+        // časť sa skopíruje, aby bola súvislá v pamäti
+        let view = Mat::roi(frame_hi, *tile)?.try_clone()?;
+        for d in detector.detect(&view)? {
+            // rámček odrezaný okrajom časti (nie okrajom celého výrezu) – môže byť len kúsok objektu
+            let cut_left = i > 0 && d.rect.x <= EDGE_PX;
+            let cut_right = i + 1 < parts.len() && d.rect.x + d.rect.width >= tile.width - EDGE_PX;
+            all.push(TileDet { det: Detection { rect: to_output_coords(d.rect, *tile, scale), ..d }, cut_left, cut_right });
+        }
+    }
+    Ok(merge_tiles(all))
+}
+
+/// Ako blízko okraja časti (px) sa rámček považuje za odrezaný.
+const EDGE_PX: i32 = 6;
+
+/// Detekcia z jednej časti výrezu: či ju odrezal ľavý / pravý okraj časti.
+#[derive(Debug, Clone)]
+pub struct TileDet {
+    pub det: Detection,
+    pub cut_left: bool,
+    pub cut_right: bool,
+}
+
+/// Široký výrez sa rozdelí na prekrývajúce sa časti: sieť každý vstup zmenší na 640 px, takže
+/// pás cez celú šírku 4K záberu by zmenšila 4x a ľudia by mali len pár desiatok px. Časti majú
+/// šírku 2,5x výšky a prekryv aspoň 1,2x výšky.
+pub fn tiles(roi: Rect) -> Vec<Rect> {
+    let tile_w = ((roi.height as f64 * 2.5) as i32).max(1);
+    if roi.width <= tile_w + tile_w / 4 {
+        return vec![roi];
+    }
+    let min_overlap = (roi.height as f64 * 1.2) as i32;
+    let stride_max = (tile_w - min_overlap).max(1);
+    let n = ((roi.width - tile_w) + stride_max - 1) / stride_max + 1;
+    let stride = (roi.width - tile_w) as f64 / (n - 1) as f64;
+    (0..n).map(|i| Rect::new(roi.x + (i as f64 * stride).round() as i32, roi.y, tile_w, roi.height)).collect()
+}
+
+fn union(a: Rect, b: Rect) -> Rect {
+    let (x0, y0) = (a.x.min(b.x), a.y.min(b.y));
+    let (x1, y1) = ((a.x + a.width).max(b.x + b.width), (a.y + a.height).max(b.y + b.height));
+    Rect::new(x0, y0, x1 - x0, y1 - y0)
+}
+
+/// Spojí detekcie z prekrývajúcich sa častí:
+///  1. kúsky toho istého objektu odrezané hranicou častí (vľavo a vpravo od nej, v rovnakej
+///     výške, prekrývajú sa) sa zlepia do jedného rámčeka,
+///  2. ten istý objekt nájdený vo viacerých častiach sa nechá raz (väčší rámček).
+pub fn merge_tiles(dets: Vec<TileDet>) -> Vec<Detection> {
+    // 1) zlepovanie odrezaných kúskov
+    let mut items: Vec<(Rect, Detection, bool)> = dets.into_iter().map(|t| (t.det.rect, t.det, t.cut_left || t.cut_right)).collect();
+    let mut changed = true;
+    while changed {
+        changed = false;
+        'outer: for i in 0..items.len() {
+            for j in 0..items.len() {
+                if i == j || group_of(&items[i].1.label) != group_of(&items[j].1.label) || !(items[i].2 || items[j].2) {
+                    continue;
+                }
+                let (a, b) = (items[i].0, items[j].0);
+                let inter = a & b;
+                let v_overlap = (a.y + a.height).min(b.y + b.height) - a.y.max(b.y);
+                // kúsky toho istého objektu majú podobnú výšku a sú v rovnakej výške
+                let (hmin, hmax) = (a.height.min(b.height) as f64, a.height.max(b.height) as f64);
+                if inter.width > 0 && v_overlap as f64 > 0.7 * hmax && hmin > 0.75 * hmax {
+                    let u = union(a, b);
+                    let score = match (items[i].1.score, items[j].1.score) {
+                        (Some(x), Some(y)) => Some(x.max(y)),
+                        (x, y) => x.or(y),
+                    };
+                    // názov podľa väčšieho kúska (bus rozdelený na "bus" a "truck" ostane "bus")
+                    let label = if a.area() >= b.area() { items[i].1.label.clone() } else { items[j].1.label.clone() };
+                    let merged = Detection { rect: u, label, score };
+                    // zlepený je stále "odrezaný", kým sa nevyrieši (môže pribudnúť ďalší kúsok)
+                    let cut = items[i].2 && items[j].2;
+                    let (lo, hi) = (i.min(j), i.max(j));
+                    items.remove(hi);
+                    items[lo] = (u, merged, cut);
+                    changed = true;
+                    break 'outer;
+                }
+            }
+        }
+    }
+    // 2) duplicity: nechá sa väčší rámček. Porovnáva sa skupina, nie trieda: ten istý autobus
+    //    býva raz "bus", raz "truck", a kúsky autobusu (okná, kolesá) sieť označí ako "car".
+    let mut dets: Vec<Detection> = items.into_iter().map(|(_, d, _)| d).collect();
+    dets.sort_by_key(|d| std::cmp::Reverse(d.rect.area()));
+    let mut kept: Vec<Detection> = vec![];
+    for d in dets {
+        let dup = kept.iter().any(|k| {
+            if group_of(&k.label) != group_of(&d.label) {
+                return false;
+            }
+            let inter = (k.rect & d.rect).area() as f64;
+            let iou = inter / ((k.rect.area() + d.rect.area()) as f64 - inter);
+            iou > 0.5 || inter / d.rect.area().max(1) as f64 > 0.7
+        });
+        if !dup {
+            kept.push(d);
+        }
+    }
+    kept
 }
 
 #[cfg(test)]
@@ -204,6 +455,47 @@ mod tests {
 
     fn det(label: &str, x: i32, y: i32) -> Detection {
         Detection { rect: Rect::new(x, y, 100, 60), label: label.into(), score: Some(0.9) }
+    }
+
+    #[test]
+    fn prisne_kreslenie_az_po_troch_detekciach() {
+        let mut core = CountingCore::new(500.0, (0.0, 1000.0), 10.0, 5).with_strict_display();
+        let mut shown = vec![];
+        for f in 0..4u64 {
+            let (items, _) = core.track_and_count(&[det("car", 100 + 30 * f as i32, 200)], f, f as f64 / 20.0);
+            shown.push(items.len());
+        }
+        assert_eq!(shown, vec![0, 0, 1, 1]);
+    }
+
+    #[test]
+    fn prisne_kreslenie_nehybny_clovek_sa_nekresli() {
+        let mut core = CountingCore::new(500.0, (0.0, 1000.0), 10.0, 5).with_strict_display();
+        // "človek" na bráne stojí na mieste: nikdy sa nenakreslí
+        for f in 0..20u64 {
+            let (items, _) = core.track_and_count(&[det("person", 300, 200)], f, f as f64 / 20.0);
+            assert!(items.is_empty(), "snímka {f}");
+        }
+        // chodec sa pohne: nakreslí sa
+        let mut core = CountingCore::new(500.0, (0.0, 1000.0), 10.0, 5).with_strict_display();
+        let last = (0..10u64).map(|f| core.track_and_count(&[det("person", 100 + 20 * f as i32, 200)], f, f as f64 / 20.0).0.len()).last();
+        assert_eq!(last, Some(1));
+    }
+
+    #[test]
+    fn autobus_z_dvoch_casti_s_inou_triedou_sa_zlepi_a_auta_v_nom_zmiznu() {
+        let t = |label: &str, x, w, cut_left, cut_right| TileDet {
+            det: Detection { rect: Rect::new(x, 100, w, 200), label: label.into(), score: Some(0.8) },
+            cut_left,
+            cut_right,
+        };
+        let out = merge_tiles(vec![
+            t("bus", 0, 600, false, true),     // ľavá časť autobusu, odrezaná pravým okrajom časti
+            t("truck", 500, 400, true, false), // pravá časť, sieť ju nazvala inak
+            t("car", 650, 150, false, false),  // okno autobusu ako "auto"
+        ]);
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert_eq!((out[0].label.as_str(), out[0].rect.x, out[0].rect.width), ("bus", 0, 900));
     }
 
     #[test]
@@ -298,7 +590,7 @@ mod tests {
     }
 
     fn item(id: u32, group: Group) -> Counted {
-        Counted { rect: Rect::new(0, 0, 10, 10), label: "x".into(), score: None, id, group }
+        Counted { rect: Rect::new(0, 0, 10, 10), label: "x".into(), score: None, id, group, speed_kmh: None }
     }
 
     #[test]
@@ -452,5 +744,141 @@ mod tests {
         let q = [(5000.0, 5000.0), (5100.0, 5000.0), (5100.0, 5100.0), (5000.0, 5100.0)];
         let r = roi_from_quad(&q, 1.0, 1280, 720);
         assert!(r.x >= 0 && r.y >= 0 && r.x + r.width <= 1280 && r.y + r.height <= 720, "{r:?}");
+    }
+
+    fn ground_model() -> crate::speed::GroundModel {
+        crate::speed::GroundModel {
+            f: 3068.36, k1: 1.3747, k2: 0.0, pitch: 0.12417, roll: -0.01673, h: 3.7694,
+            cx: 1920.0, cy: 1080.0, width: 3840.0, height: 2160.0, snapshot: None, points: vec![],
+        }
+    }
+
+    #[test]
+    fn jadro_meria_rychlost_pri_prechode() {
+        // výstup 1280x720 (model je 3x väčší); auto ide po ceste (spodok rámčeka v y=480),
+        // 12 px na snímku pri 20 fps
+        let m = ground_model();
+        let mapper = GroundMapper::new(m.clone(), 1280.0, 720.0).unwrap();
+        let mut core = CountingCore::new(640.0, (0.0, 720.0), 12.0, 12).with_speed(mapper);
+        let (mut ev, mut last_items) = (vec![], vec![]);
+        for f in 0..60u64 {
+            let x = 300 + 12 * f as i32;
+            let (items, e) = core.track_and_count(&[Detection { rect: Rect::new(x, 420, 100, 60), label: "car".into(), score: None }], f, f as f64 / 20.0);
+            ev.extend(e);
+            last_items = items;
+        }
+        assert_eq!(ev.len(), 1);
+        // očakávaná rýchlosť priamo z modelu: posun spodku rámčeka o 12 px za 1/20 s
+        let a = m.to_ground(3.0 * 690.0, 3.0 * 480.0).unwrap();
+        let b = m.to_ground(3.0 * 702.0, 3.0 * 480.0).unwrap();
+        let expect = ((a.0 - b.0).powi(2) + (a.1 - b.1).powi(2)).sqrt() * 20.0 * 3.6;
+        let v = ev[0].speed_kmh.expect("pri prechode sa má zmerať rýchlosť");
+        assert!((v - expect).abs() / expect < 0.05, "{v} vs {expect}");
+        assert_eq!(core.counter().events()[0].speed_kmh, Some(v), "rýchlosť je aj v uložených udalostiach");
+        assert!(last_items[0].speed_kmh.is_some());
+    }
+
+    #[test]
+    fn jadro_bez_modelu_nema_rychlost() {
+        let mut core = CountingCore::new(500.0, (0.0, 1000.0), 12.0, 12);
+        for f in 0..30u64 {
+            let (items, _) = core.track_and_count(&[det("car", 100 + 30 * f as i32, 100)], f, f as f64 / 20.0);
+            assert_eq!(items[0].speed_kmh, None);
+        }
+        assert!(core.counter().events().iter().all(|e| e.speed_kmh.is_none()));
+    }
+
+    #[test]
+    fn strateny_objekt_sa_chvilu_este_kresli() {
+        let mut core = CountingCore::new(500.0, (0.0, 1000.0), 12.0, 12);
+        core.track_and_count(&[det("car", 100, 100)], 0, 0.0);
+        // detektor auto na pár snímok nenájde: stále sa vráti (na poslednom mieste)
+        for f in 1..=COAST_FRAMES as u64 {
+            let (items, _) = core.track_and_count(&[], f, f as f64 / 20.0);
+            assert_eq!(items.len(), 1, "snímka {f}");
+            assert_eq!(items[0].rect, Rect::new(100, 100, 100, 60));
+        }
+        // potom už nie
+        let (items, _) = core.track_and_count(&[], 99, 5.0);
+        assert!(items.is_empty());
+    }
+
+    #[test]
+    fn siroky_pas_sa_rozdeli_na_casti() {
+        // pás 2560x504 (ulica cez celý záber): 3 časti po 1260 px s prekryvom >= 605 px
+        let roi = Rect::new(0, 720, 2560, 504);
+        let t = tiles(roi);
+        assert_eq!(t.len(), 3, "{t:?}");
+        assert_eq!(t[0].x, 0);
+        assert_eq!(t.last().unwrap().x + t.last().unwrap().width, 2560, "pokryje celý pás");
+        for w in t.windows(2) {
+            assert!(w[0].x + w[0].width - w[1].x >= 605, "prekryv {w:?}");
+        }
+        assert!(t.iter().all(|r| r.y == 720 && r.height == 504));
+        // úzky výrez sa nedelí
+        assert_eq!(tiles(Rect::new(10, 20, 1200, 475)), vec![Rect::new(10, 20, 1200, 475)]);
+    }
+
+    #[test]
+    fn spojenie_casti_necha_objekt_raz() {
+        let d = |x, w, label: &str, cl, cr| TileDet {
+            det: Detection { rect: Rect::new(x, 100, w, 80), label: label.into(), score: Some(0.8) },
+            cut_left: cl,
+            cut_right: cr,
+        };
+        // celé auto z jednej časti, odrezaná časť toho istého auta z druhej, rovnaké auto 2x, iný objekt
+        let out = merge_tiles(vec![
+            d(500, 300, "car", false, false),
+            d(600, 200, "car", true, false),
+            d(502, 298, "car", false, false),
+            d(560, 40, "person", false, false),
+        ]);
+        assert_eq!(out.len(), 2, "{out:?}");
+        assert!(out.iter().any(|x| x.label == "car" && x.rect.width == 300));
+        assert!(out.iter().any(|x| x.label == "person"), "človek pred autom ostane");
+    }
+
+    #[test]
+    fn odrezane_kusky_auta_sa_zlepia() {
+        // auto je širšie než prekryv: ľavá časť ho odreže vpravo, pravá vľavo
+        let a = TileDet { det: Detection { rect: Rect::new(400, 100, 250, 80), label: "car".into(), score: Some(0.7) }, cut_left: false, cut_right: true };
+        let b = TileDet { det: Detection { rect: Rect::new(560, 102, 240, 78), label: "car".into(), score: Some(0.9) }, cut_left: true, cut_right: false };
+        let out = merge_tiles(vec![a, b]);
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert_eq!(out[0].rect, Rect::new(400, 100, 400, 80));
+        assert_eq!(out[0].score, Some(0.9));
+    }
+
+    #[test]
+    fn dve_auta_vedla_seba_sa_nezlepia() {
+        // dve celé (neodrezané) autá, ktoré sa dotýkajú, ostanú dve
+        let d = |x| TileDet { det: Detection { rect: Rect::new(x, 100, 200, 80), label: "car".into(), score: Some(0.8) }, cut_left: false, cut_right: false };
+        assert_eq!(merge_tiles(vec![d(100), d(290)]).len(), 2);
+    }
+
+    #[test]
+    fn auto_s_nizkou_istotou_sa_ignoruje_clovek_nie() {
+        let mut core = CountingCore::new(500.0, (0.0, 1000.0), 12.0, 12);
+        let d = |label: &str, x, s| Detection { rect: Rect::new(x, 100, 100, 60), label: label.into(), score: Some(s) };
+        let (items, _) = core.track_and_count(&[d("car", 0, 0.3), d("person", 300, 0.3), d("car", 600, 0.5)], 0, 0.0);
+        let labels: Vec<_> = items.iter().map(|i| (i.label.as_str(), i.rect.x)).collect();
+        assert_eq!(labels, vec![("person", 300), ("car", 600)]);
+    }
+
+    #[test]
+    fn nehybne_vozidlo_sa_po_chvili_nekresli() {
+        let mut core = CountingCore::new(500.0, (0.0, 1000.0), 12.0, 12);
+        let mut shown = vec![];
+        for f in 0..60u64 {
+            let t = f as f64 / 20.0;
+            // skrinka (stojí, mierne sa chveje), stojaci človek, idúce auto
+            let dets = [det("truck", 100 + (f % 2) as i32, 100), det("person", 300, 300), det("car", 20 * f as i32, 600)];
+            let (items, _) = core.track_and_count(&dets, f, t);
+            shown.push(items.iter().map(|i| i.label.clone()).collect::<Vec<_>>());
+        }
+        assert!(shown[10].contains(&"truck".to_string()), "prvé 2 s sa ešte kreslí");
+        assert!(!shown[59].contains(&"truck".to_string()), "nehybné vozidlo zmizne: {:?}", shown[59]);
+        assert!(shown[59].contains(&"person".to_string()), "stojaci človek ostáva");
+        assert!(shown[59].contains(&"car".to_string()), "idúce auto ostáva");
     }
 }

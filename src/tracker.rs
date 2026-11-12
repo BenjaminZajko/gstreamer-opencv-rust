@@ -13,6 +13,16 @@ pub struct Track {
     pub rect: Rect,
     /// Koľko snímok za sebou sa objekt nenašiel (napr. ho zakryl plot).
     pub missed: u32,
+    /// Odhad pohybu stredu (px za snímku), aby sa objekt našiel aj po zakrytí (napr. oblúkom).
+    pub vel: (f64, f64),
+}
+
+impl Track {
+    /// Kde by mal byť stred objektu po `frames` snímkach podľa doterajšieho pohybu.
+    pub fn predicted_center(&self, frames: u32) -> (f64, f64) {
+        let (x, y) = center(&self.rect);
+        (x + self.vel.0 * frames as f64, y + self.vel.1 * frames as f64)
+    }
 }
 
 /// Sledovač.
@@ -53,7 +63,8 @@ impl Tracker {
         // všetky možné dvojice (objekt, detekcia) v dosahu, zoradené od najbližších
         let mut pairs: Vec<(f64, usize, usize)> = vec![];
         for (ti, t) in self.tracks.iter().enumerate() {
-            let (tx, ty) = center(&t.rect);
+            // hľadá sa okolo miesta, kam sa objekt mal posunúť (pri stojacom = posledné miesto)
+            let (tx, ty) = t.predicted_center(t.missed + 1);
             let reach = (t.rect.width.max(t.rect.height) as f64) * (1.0 + 0.5 * t.missed as f64) + 20.0;
             for (di, (r, g)) in dets.iter().enumerate() {
                 if *g != t.group {
@@ -82,14 +93,20 @@ impl Tracker {
         for (di, (rect, group)) in dets.iter().enumerate() {
             match det_track[di] {
                 Some(ti) => {
-                    self.tracks[ti].rect = *rect;
-                    self.tracks[ti].missed = 0;
+                    let t = &mut self.tracks[ti];
+                    let (ox, oy) = center(&t.rect);
+                    let (nx, ny) = center(rect);
+                    let k = (t.missed + 1) as f64;
+                    // vyhladený pohyb (nová rýchlosť má váhu 1/2)
+                    t.vel = (0.5 * t.vel.0 + 0.5 * (nx - ox) / k, 0.5 * t.vel.1 + 0.5 * (ny - oy) / k);
+                    t.rect = *rect;
+                    t.missed = 0;
                     ids.push(self.tracks[ti].id);
                 }
                 None => {
                     let id = self.next_id;
                     self.next_id += 1;
-                    self.tracks.push(Track { id, group: *group, rect: *rect, missed: 0 });
+                    self.tracks.push(Track { id, group: *group, rect: *rect, missed: 0, vel: (0.0, 0.0) });
                     ids.push(id);
                 }
             }
@@ -168,6 +185,20 @@ mod tests {
             t.update(&[]); // zakrytý plotom
         }
         assert_eq!(t.update(&[(r(120, 0), CAR)]).ids, vec![1], "po 4 chýbajúcich snímkach to je stále to isté auto");
+    }
+
+    #[test]
+    fn rychle_auto_za_prekazkou_si_zachova_id() {
+        // auto ide 30 px/snímku, potom ho na 8 snímok zakryje oblúk (posunie sa o 270 px):
+        // bez odhadu pohybu by bolo mimo dosahu a dostalo by nové ID
+        let mut t = Tracker::new(12);
+        for i in 0..10 {
+            t.update(&[(r(i * 30, 0), CAR)]);
+        }
+        for _ in 0..8 {
+            t.update(&[]);
+        }
+        assert_eq!(t.update(&[(r(18 * 30, 0), CAR)]).ids, vec![1]);
     }
 
     #[test]

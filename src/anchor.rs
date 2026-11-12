@@ -922,6 +922,45 @@ impl Anchor {
     }
 }
 
+/// Jednorazové zarovnanie dvoch záberov tej istej scény (napr. snímka z merania a záber pri
+/// štarte): homografia `to <- from` cez ORB + RANSAC a počet zhodných bodov.
+/// `None`, ak sa zábery nedajú spoľahlivo spárovať (iná scéna, primálo zhôd).
+pub fn align_images(from_gray: &Mat, to_gray: &Mat, features: i32, min_inliers: usize) -> Result<Option<(Homography, usize)>> {
+    let mut orb = ORB::create(features, 1.2, 8, 31, 0, 2, opencv::features::ORB_ScoreType::HARRIS_SCORE, 31, 20)?;
+    let (mut kp_a, mut desc_a) = (Vector::<KeyPoint>::new(), Mat::default());
+    let (mut kp_b, mut desc_b) = (Vector::<KeyPoint>::new(), Mat::default());
+    orb.detect_and_compute(from_gray, &no_array(), &mut kp_a, &mut desc_a, false)?;
+    orb.detect_and_compute(to_gray, &no_array(), &mut kp_b, &mut desc_b, false)?;
+    if kp_a.len() < min_inliers || kp_b.len() < min_inliers || desc_a.rows() < 2 || desc_b.rows() < 2 {
+        return Ok(None);
+    }
+    let matcher = BFMatcher::new(NORM_HAMMING, false)?;
+    let mut knn = Vector::<Vector<DMatch>>::new();
+    matcher.knn_train_match_def(&desc_a, &desc_b, &mut knn, 2)?;
+    let (mut src, mut dst) = (Vector::<Point2f>::new(), Vector::<Point2f>::new());
+    for pair in knn.iter() {
+        if pair.len() == 2 && pair.get(0)?.distance < 0.75 * pair.get(1)?.distance {
+            let m = pair.get(0)?;
+            src.push(kp_a.get(m.query_idx as usize)?.pt());
+            dst.push(kp_b.get(m.train_idx as usize)?.pt());
+        }
+    }
+    if src.len() < min_inliers {
+        return Ok(None);
+    }
+    let mut mask = Mat::default();
+    let h = geometry::find_homography(&src, &dst, geometry::RANSAC, 3.0, &mut mask, 2000, 0.995)?;
+    let Some(hom) = Homography::from_mat(&h) else { return Ok(None) };
+    let flags = mask.data_bytes().map(|b| b.to_vec()).unwrap_or_default();
+    let inlier_pts: Vec<(f64, f64)> =
+        src.iter().zip(&flags).filter(|(_, f)| **f != 0).map(|(p, _)| (p.x as f64, p.y as f64)).collect();
+    let (w, h) = (from_gray.cols() as f64, from_gray.rows() as f64);
+    if inlier_pts.len() < min_inliers || !spread_ok(&inlier_pts, w, h) || !hom.is_plausible(w, h) {
+        return Ok(None);
+    }
+    Ok(Some((hom, inlier_pts.len())))
+}
+
 /// Aké pokrytie záberu sa vyžaduje od malej sady bodov pri jemnom sledovaní (menej prísne než ORB).
 pub const FINE_SPREAD: f64 = 0.25;
 
@@ -1928,5 +1967,25 @@ mod tests {
         let (c3, _) = hold(&mut a, &s, &h, 0.2, 80, 30, 300);
         assert_eq!((c1, c2, c3), (0, 0, 0), "otočená / pôvodná / znova otočená");
         assert!(a.homography().max_corner_shift(&h, W as f64, H as f64) < 40.0, "poloha zodpovedá otočeniu");
+    }
+
+    #[test]
+    fn zarovnanie_dvoch_zaberov() {
+        // záber pootočený o 2° a posunutý: zarovnanie musí nájsť tú istú transformáciu
+        let a = scene(7);
+        let (c, s) = (2f64.to_radians().cos(), 2f64.to_radians().sin());
+        let (cx, cy) = (W as f64 / 2.0, H as f64 / 2.0);
+        let truth = Homography([c, -s, cx - c * cx + s * cy + 12.0, s, c, cy - s * cx - c * cy - 7.0, 0.0, 0.0, 1.0]);
+        let b = moved(&a, &truth);
+        let (h, n) = align_images(&a, &b, 1500, 20).unwrap().expect("zábery sa majú zarovnať");
+        assert!(n >= 20);
+        for p in [(100.0, 100.0), (500.0, 300.0), (W as f64 - 100.0, H as f64 - 100.0)] {
+            assert!(close(h.apply(p), truth.apply(p), 1.5), "{p:?}: {:?} vs {:?}", h.apply(p), truth.apply(p));
+        }
+    }
+
+    #[test]
+    fn zarovnanie_roznych_scen_zlyha() {
+        assert!(align_images(&scene(1), &scene(2), 1500, 20).unwrap().is_none());
     }
 }

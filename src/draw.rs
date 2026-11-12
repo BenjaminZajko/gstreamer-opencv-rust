@@ -62,6 +62,10 @@ pub fn draw(frame: &mut Mat, dets: &[Detection], idx: u64) -> Result<()> {
     Ok(())
 }
 
+/// Najnižšia rýchlosť, ktorá sa pri objekte vypíše (km/h). Stojaci človek alebo auto má kvôli
+/// chveniu rámčeka odhad 0–2 km/h, to by bolo mätúce.
+pub const MIN_SHOWN_KMH: f64 = 3.0;
+
 /// Detekcia, ktorá je zároveň sledovaná (má stále ID) – vstup pre `draw_counting`.
 #[derive(Debug, Clone)]
 pub struct Counted {
@@ -70,6 +74,8 @@ pub struct Counted {
     pub score: Option<f32>,
     pub id: u32,
     pub group: Group,
+    /// aktuálna rýchlosť (km/h), ak je zapnutý model kamery
+    pub speed_kmh: Option<f64>,
 }
 
 /// Nakreslí zvislú čiaru, sledované objekty (farba podľa skupiny, s ID) a panel s počtami.
@@ -101,28 +107,7 @@ pub fn draw_counting(frame: &mut Mat, items: &[Counted], counts: &CountsView) ->
         0,
     )?;
 
-    for it in items {
-        let color = match it.group {
-            Group::Vehicle => Scalar::new(0.0, 140.0, 255.0, 0.0), // oranžová (BGR)
-            Group::Person => Scalar::new(0.0, 255.0, 0.0, 0.0),    // zelená
-        };
-        imgproc::rectangle(frame, it.rect, color, 2, imgproc::LINE_8, 0)?;
-        let text = match it.score {
-            Some(s) => format!("{} #{} {:.0}%", it.label, it.id, s * 100.0),
-            None => format!("{} #{}", it.label, it.id),
-        };
-        imgproc::put_text(
-            frame,
-            &text,
-            Point::new(it.rect.x, (it.rect.y - 6).max(14)),
-            imgproc::FONT_HERSHEY_SIMPLEX,
-            0.55,
-            color,
-            2,
-            imgproc::LINE_AA,
-            false,
-        )?;
-    }
+    draw_objects(frame, items)?;
 
     // panel s počtami vľavo hore na tmavom pozadí
     imgproc::rectangle(
@@ -161,6 +146,51 @@ pub fn draw_counting(frame: &mut Mat, items: &[Counted], counts: &CountsView) ->
             imgproc::LINE_AA,
             false,
         )?;
+    }
+    Ok(())
+}
+
+/// Sledované objekty: rámček (farba podľa skupiny), názov a rýchlosť.
+pub fn draw_objects(frame: &mut Mat, items: &[Counted]) -> Result<()> {
+    for it in items {
+        let color = match it.group {
+            Group::Vehicle => Scalar::new(0.0, 140.0, 255.0, 0.0), // oranžová (BGR)
+            Group::Person => Scalar::new(0.0, 255.0, 0.0, 0.0),    // zelená
+        };
+        imgproc::rectangle(frame, it.rect, color, 2, imgproc::LINE_8, 0)?;
+        let mut text = match it.score {
+            Some(s) => format!("{} #{} {:.0}%", it.label, it.id, s * 100.0),
+            None => format!("{} #{}", it.label, it.id),
+        };
+        // pomalšie než chôdza = stojí (1–2 km/h je len chvenie rámčeka), rýchlosť sa nepíše
+        if let Some(v) = it.speed_kmh.filter(|v| *v >= MIN_SHOWN_KMH) {
+            text += &format!(" {v:.0} km/h");
+        }
+        imgproc::put_text(
+            frame,
+            &text,
+            Point::new(it.rect.x, (it.rect.y - 6).max(14)),
+            imgproc::FONT_HERSHEY_SIMPLEX,
+            0.55,
+            color,
+            2,
+            imgproc::LINE_AA,
+            false,
+        )?;
+    }
+    Ok(())
+}
+
+/// Očíslované body (referenčné body z merania): žltý krúžok a číslo na tmavom pozadí.
+pub fn draw_numbered_points(frame: &mut Mat, points: &[(u32, (f64, f64))]) -> Result<()> {
+    let yellow = Scalar::new(0.0, 255.0, 255.0, 0.0);
+    for &(id, (x, y)) in points {
+        let p = Point::new(x.round() as i32, y.round() as i32);
+        imgproc::circle(frame, p, 6, yellow, 2, imgproc::LINE_AA, 0)?;
+        let label = id.to_string();
+        let org = Point::new(p.x + 6, p.y - 10);
+        imgproc::rectangle(frame, Rect::new(org.x - 3, org.y - 17, 14 * label.len() as i32 + 6, 22), Scalar::new(0.0, 0.0, 200.0, 0.0), imgproc::FILLED, imgproc::LINE_8, 0)?;
+        imgproc::put_text(frame, &label, org, imgproc::FONT_HERSHEY_SIMPLEX, 0.6, Scalar::all(255.0), 2, imgproc::LINE_AA, false)?;
     }
     Ok(())
 }
@@ -272,7 +302,7 @@ mod tests {
     // ---- draw_counting ----
 
     fn counted(id: u32, g: Group) -> Counted {
-        Counted { rect: Rect::new(100, 200, 80, 60), label: "car".into(), score: Some(0.9), id, group: g }
+        Counted { rect: Rect::new(100, 200, 80, 60), label: "car".into(), score: Some(0.9), id, group: g, speed_kmh: None }
     }
 
     #[test]

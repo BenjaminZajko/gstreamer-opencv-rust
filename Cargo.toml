@@ -10,3 +10,4 @@ gstreamer-app = "0.25.2"
 gstreamer-rtsp-server = "0.25.2"
 gstreamer-video = "0.25.4"
 opencv = "0.101.1"
+ort = { version = "=2.0.0-rc.15", features = ["coreml"] }

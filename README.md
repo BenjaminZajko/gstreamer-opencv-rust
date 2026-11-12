@@ -2,6 +2,21 @@
 
 Detekcia objektov vo videu: **GStreamer** dekóduje a zakóduje video (HW enkodér VideoToolbox na macOS), **OpenCV** detekuje objekty. Napísané v Ruste.
 
+## Rýchly štart (živá kamera -> VLC)
+1. Nainštaluj požiadavky a stiahni model (pozri nižšie), potom `cargo build --release`.
+2. Vytvor súbor s údajmi ku kamere `../GStream_configuration/camera.conf` (mimo repozitára, nikdy ho nenahrávaj):
+   ```bash
+   CAM_IP=192.168.0.100
+   CAM_USER=pouzivatel
+   CAM_PASS=heslo
+   ```
+   (alebo cestu zadaj premennou `CAM_CONF=/cesta/camera.conf`). Kamera musí mať zapnutý RTSP (Tapo: účet kamery v aplikácii).
+3. `./live.sh count` a vo VLC *Médiá → Otvoriť sieťový stream* → adresa, ktorú vypíše (`rtsp://<ip-macu>:8554/detect`).
+4. `./live.sh stop` zastaví.
+
+Bez kalibrácie (`calib/`) beží detekcia a počítanie na pôvodnom (fisheye) obraze bez rýchlosti. S kalibráciou
+(pozri „Kalibrácia kamery“) je obraz rovný a pri autách aj ľuďoch sa ukazuje rýchlosť v km/h.
+
 ## Požiadavky (macOS)
 ```bash
 brew install gstreamer opencv
@@ -55,7 +70,7 @@ vidieť **celý záber** s čiarou, rámčekmi, ID a počtami. Počíta sa aj vt
 Vo VLC: *Médiá → Otvoriť sieťový stream* → `rtsp://localhost:8554/detect`.
 
 Poloha čiary a výrez sa menia premennými (zlomky záberu):
-`LINE=0.3 SPAN=0.5,0.9 ROI=0,0.5,0.5,0.4 ./live.sh count`
+`LINE=0.3 SPAN=0.5,0.9 ROI=0,0.5,0.5,0.4 ./live.sh count` (predvolene `LINE=0.3 SPAN=0.5,0.85 ROI=0,0.5,1,0.35`, `ENGINE=coreml`, `CONF=0.25`)
 - `LINE` poloha zvislej čiary (zlomok šírky), `SPAN` pásmo výšky, v ktorom sa počíta,
 - `ROI` výrez, na ktorom beží detekcia (zobrazuje sa celý záber, ale YOLOX vidí len výrez – vďaka tomu
   nestratí detaily, keď sa 4K zmenší na 640 px).
@@ -108,6 +123,58 @@ Výsledky v `out/`: `<názov>_counted.mp4` (video s čiarou, rámčekmi a počta
 `<názov>_summary.txt` a `<názov>_reference.jpg` (vybrané referenčné body). Voľby sú rovnaké ako pri živom
 počítaní (`--conf`, `--anchor on|off`, `--width`, `--detect-width`...), navyše `--output cesta/video.mp4`.
 
+## Rýchlosť áut a ľudí (`--speed`)
+Model kamery prevádza polohu v obraze na metre na zemi, takže z pohybu sledovaného objektu
+sa dá vypočítať rýchlosť v km/h. Zobrazí sa pri rámčeku a pri každom prechode cez čiaru
+sa zapíše do CSV (stĺpec `speed_kmh` / `rychlost_kmh`) a do súhrnu (priemer, min, max).
+```bash
+./target/release/video_count video.mp4 --line 0.5 --line-span 0.5,0.85 --roi 0,0.5,1,0.35 --speed calib/camera_model.json
+./live.sh count      # live.sh pridá --speed sám, ak existuje calib/camera_model.json
+```
+Model sa počíta z meraní na mieste (`calib/calibrate.py`: vzdialenosti referenčných bodov od kamery,
+výška kamery a pár vzdialeností medzi bodmi) a platí len pre tú polohu kamery, v ktorej sa merala.
+Ak sa kamera od merania pootočila, záber sa pri štarte sám zarovná so snímkou z merania
+(`calib/snapshot_4k.jpg`) a počas behu pohyb kamery vyrovnáva ukotvenie – čiara, referenčné body 1–8
+(žlté krúžky s číslami) aj model rýchlosti ostávajú na tom istom mieste ulice.
+Poloha objektu na zemi je stred spodnej hrany rámčeka (kolesá, chodidlá); rýchlosť je sklon priamky
+cez polohy za posledných 1,2 s. Priečinok `calib/` je v `.gitignore` (obsahuje fotky okolia).
+
+## Rovný obraz (`--dewarp`) a čistý pohľad (`--clean`)
+`live.sh count` predvolene zapne obe, ak existuje `calib/dewarp/dewarp.json`:
+- **Rovný obraz:** každá snímka sa hneď na vstupe prevedie z fisheye na rovný obraz (bez skreslenia, vyrovnaný
+  náklon, orezaný tak, aby nemal čierne okraje). Detekcia, sledovanie, rýchlosť aj kreslenie bežia na ňom.
+  Prevod je predpočítaná tabuľka (`cv::remap`), stojí pár ms na snímku.
+- **Čistý pohľad:** v obraze sú len rámčeky áut a ľudí s rýchlosťou – bez čiary, panelu a bodov.
+  Prechody sa ďalej zapisujú do `out/`.
+- Vypnutie: `DEWARP= ./live.sh count` (pôvodný obraz), `CLEAN=0 ./live.sh count` (čiara a počty v obraze).
+- Pri rovnom obraze sú predvolené `ROI=0,0.27,1,0.37` a pásmo čiary `0.33,0.62` (dá sa zmeniť premennými
+  `ROI` a `SPAN_DW`).
+- Obrázok sa dá previesť aj ručne: `cargo run --release --example dewarp_image -- calib/dewarp/dewarp.json vstup.jpg vystup.jpg`.
+
+Čo sa kreslí: objekt až po 3 detekciách (jednorazové omyly siete sa neukážu), „vozidlo“, ktoré sa nepohlo,
+sa po 2 s skryje (skrinka, zaparkované auto) a „človek“ sa ukáže až keď sa pohne (ozdoby brány).
+Kúsky jedného vozidla z rôznych častí výrezu sa spájajú aj keď ich sieť nazve inak (bus/truck) a menšie rámčeky
+vnútri väčšieho vozidla (okná autobusu ako „car“) sa zahodia.
+
+Časy snímok: kamera posiela snímky v zhlukoch s rovnakou časovou značkou; časy sa vyhladia (`FrameClock`),
+inak by rýchlosť pri zhluku vyskočila.
+
+## Kalibrácia kamery (rýchlosť a rovný obraz)
+Robí sa raz pre danú kameru a miesto; výsledok je v `calib/` (v `.gitignore` – fotky okolia a merania).
+1. **Skreslenie objektívu z mriežky:** pred kameru sa dá mriežkovaný papier (čo najväčší, cez celý záber) a
+   z priemeru ~10 snímok sa nájdu čiary mriežky. Hľadá sa korekcia (k1, k2, stred), po ktorej sú rovné
+   (metóda rovných čiar, nezáleží na sklone papiera). Výsledok: čiary rovné na ~3 px (bez korekcie 23 px).
+2. **Merania na mieste (laser):** vzdialenosti od päty kamery k 6–8 bodom na zemi (blízko aj na druhej strane
+   ulice, vľavo aj vpravo), výška kamery a 1–2 vzdialenosti medzi bodmi. Z nich sa dopočíta ohnisko, sklon,
+   náklon a výška kamery.
+3. **Sklon automaticky z obrazu:** zo zvislých hrán (domy, stĺpy) v rovnom obraze sa nájde úbežník a z neho
+   sklon a náklon kamery – zhoda s meraním laserom do 0,3°.
+4. Z modelu sa pripraví rovný obraz (`calib/dewarp/`: `dewarp.json`, model rýchlosti, snímka z merania a body).
+
+Overenie: moped s tachometrom na 26 km/h, 3 prejazdy → 25,2 / 26,6 / 26,0 km/h (chyba pod 1 % v priemere,
+jednotlivé prejazdy ±3 %). Bez korekcie fisheye bola chyba na okrajoch záberu až −50 %, s korekciou len z meraní
+laserom −6,5 %.
+
 ## Počítanie prechodov cez čiaru zo súboru s pevným orezaním (`line_count`)
 Z videa sa orezá zadaná časť záberu (napr. len cesta), YOLOX nájde autá a ľudí, tracker im pridelí ID
 a program počíta, koľkí prešli cez zvislú čiaru, zvlášť podľa smeru.
@@ -144,6 +211,6 @@ na presnosť je malý. Hlavná záťaž je samotná sieť YOLOX (~84 ms na sním
 ```bash
 cargo test --release
 ```
-Unit testy (203), testy počítania (10) a e2e testy: súbory (8), živý server a počítanie (13), `line_count` (8), ukotvenie (5), `video_count` (5). Testy s modelom sa bez neho preskočia.
+Unit testy (255), testy počítania (10) a e2e testy: súbory (8), živý server a počítanie (13), `line_count` (8), ukotvenie (5), `video_count` (5). Testy s modelom sa bez neho preskočia.
 
 Poznámka: projekt používa OpenCV 5 (crate `opencv` 0.101), kde sú niektoré funkcie v iných moduloch než v OpenCV 4.

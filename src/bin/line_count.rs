@@ -75,7 +75,7 @@ fn main() -> Result<()> {
         for ((d, group), id) in dets.into_iter().zip(update.ids) {
             let cx = d.rect.x as f64 + d.rect.width as f64 / 2.0;
             counter.observe(frames, time_s, id, group, cx);
-            items.push(Counted { rect: d.rect, label: d.label, score: d.score, id, group });
+            items.push(Counted { rect: d.rect, label: d.label, score: d.score, id, group, speed_kmh: None });
         }
         for id in update.ended {
             counter.forget(id);

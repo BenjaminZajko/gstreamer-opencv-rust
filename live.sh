@@ -17,9 +17,22 @@ STREAM="${STREAM:-stream1}"
 PORT="${PORT:-8554}"
 MOUNT="${MOUNT:-/detect}"
 # nastavenie počítania pre aktuálny záber (zlomky obrazu); dá sa prepísať premennými prostredia
-LINE="${LINE:-0.235}"           # poloha zvislej čiary (zlomok šírky záberu)
-SPAN="${SPAN:-0.52,0.85}"       # pásmo výšky, v ktorom sa počíta
-ROI="${ROI:-0,0.52,0.47,0.33}"  # výrez, na ktorom beží detekcia: x,y,w,h
+LINE="${LINE:-0.3}"             # poloha zvislej čiary (zlomok šírky záberu)
+SPAN="${SPAN:-0.5,0.85}"        # pásmo výšky, v ktorom sa počíta
+# rovný obraz bez fisheye (calib/make_dewarp.py); DEWARP= (prázdne) = pôvodný fisheye obraz
+DEWARP="${DEWARP-$DIR/calib/dewarp/dewarp.json}"
+if [ -n "$DEWARP" ] && [ -f "$DEWARP" ]; then
+  ROI="${ROI:-0,0.27,1,0.37}"   # výrez v rovnom obraze: pás s ulicou (aj strecha autobusu)
+  SPAN="${SPAN_DW:-0.33,0.62}"  # pásmo čiary v rovnom obraze (cesta)
+  SPEED_MODEL="${SPEED_MODEL:-$(dirname "$DEWARP")/camera_model.json}"
+else
+  DEWARP=""
+  ROI="${ROI:-0,0.5,1,0.35}"    # výrez, na ktorom beží detekcia: x,y,w,h (pás s ulicou)
+fi
+CLEAN="${CLEAN:-1}"             # 1 = v obraze len autá a ľudia s rýchlosťou (bez čiary, panelu, bodov)
+CONF="${CONF:-0.25}"            # minimálna istota detekcie (nižšie = menej blikania, viac objektov)
+ENGINE="${ENGINE:-coreml}"      # na čom beží sieť: coreml (GPU, ~4x rýchlejšie) alebo opencv (CPU)
+SPEED_MODEL="${SPEED_MODEL:-$DIR/calib/camera_model_grid.json}"  # model kamery (skreslenie z mriežky + laser) = rýchlosť v km/h
 PIDFILE="$DIR/live.pid"
 LOG="$DIR/live.log"
 BIN="$DIR/target/release/object_detect_live"
@@ -32,7 +45,11 @@ url()     { echo "rtsp://$(my_ip):$PORT$MOUNT"; }
 # "count" = "start" so zapnutým počítaním
 if [ "$1" = count ]; then
   shift
-  set -- start --line "$LINE" --line-span "$SPAN" --roi "$ROI" "$@"
+  set -- start --line "$LINE" --line-span "$SPAN" --roi "$ROI" --engine "$ENGINE" --conf "$CONF" "$@"
+  # rýchlosť sa meria, ak existuje model kamery (calib/camera_model.json)
+  [ -f "$SPEED_MODEL" ] && set -- "$@" --speed "$SPEED_MODEL"
+  [ -n "$DEWARP" ] && set -- "$@" --dewarp "$DEWARP"
+  [ "$CLEAN" = 1 ] && set -- "$@" --clean
 fi
 
 case "$1" in

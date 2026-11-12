@@ -357,7 +357,7 @@ fn pocitanie_vytvori_subory_s_poctami_aj_bez_divaka() {
         .find(|e| e.file_name().to_string_lossy().ends_with("_events.csv"))
         .expect("CSV s prechodmi");
     let text = std::fs::read_to_string(csv.path()).unwrap();
-    assert_eq!(text.lines().next().unwrap(), "cas,track_id,skupina,smer,spolu_auta,spolu_ludia");
+    assert_eq!(text.lines().next().unwrap(), "cas,track_id,skupina,smer,spolu_auta,spolu_ludia,rychlost_kmh");
     assert!(s.alive());
 }
 

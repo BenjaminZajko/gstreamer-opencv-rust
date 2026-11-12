@@ -98,6 +98,15 @@ pub struct CrossEvent {
     pub track: u32,
     pub group: Group,
     pub direction: Direction,
+    /// rýchlosť v čase prechodu (km/h), ak je zapnutý model kamery
+    pub speed_kmh: Option<f64>,
+}
+
+impl CrossEvent {
+    /// " 42.0 km/h" (alebo prázdne, ak sa rýchlosť nemerala) – na výpis.
+    pub fn speed_text(&self) -> String {
+        self.speed_kmh.map(|v| format!(" {v:.1} km/h")).unwrap_or_default()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -177,9 +186,23 @@ impl LineCounter {
             _ => return None, // prvé zaradenie alebo žiadna zmena
         };
         *self.counts.entry((group, direction)).or_insert(0) += 1;
-        let ev = CrossEvent { frame, time_s, track, group, direction };
+        let ev = CrossEvent { frame, time_s, track, group, direction, speed_kmh: None };
         self.events.push(ev.clone());
         Some(ev)
+    }
+
+    /// Doplní rýchlosť k práve zaznamenanému (poslednému) prechodu.
+    pub fn set_last_speed(&mut self, speed_kmh: Option<f64>) {
+        if let Some(e) = self.events.last_mut() {
+            e.speed_kmh = speed_kmh;
+        }
+    }
+
+    /// Doplní (spresní) rýchlosť prechodu s poradím `idx` v `events()`.
+    pub fn set_event_speed(&mut self, idx: usize, speed_kmh: Option<f64>) {
+        if let Some(e) = self.events.get_mut(idx) {
+            e.speed_kmh = speed_kmh;
+        }
     }
 
     /// Objekt zanikol – zabudneme jeho stranu.
@@ -202,9 +225,10 @@ impl LineCounter {
 
     /// Udalosti ako CSV (hlavička + riadky).
     pub fn events_csv(&self) -> String {
-        let mut s = String::from("time_s,frame,track_id,group,direction\n");
+        let mut s = String::from("time_s,frame,track_id,group,direction,speed_kmh\n");
         for e in &self.events {
-            s += &format!("{:.2},{},{},{},{}\n", e.time_s, e.frame, e.track, e.group.name(), e.direction.name());
+            let speed = e.speed_kmh.map(|v| format!("{v:.1}")).unwrap_or_default();
+            s += &format!("{:.2},{},{},{},{},{speed}\n", e.time_s, e.frame, e.track, e.group.name(), e.direction.name());
         }
         s
     }
@@ -219,7 +243,17 @@ impl LineCounter {
                 self.count(g, Direction::RightToLeft)
             )
         };
-        line(Group::Vehicle, "Autá") + &line(Group::Person, "Ľudia")
+        let mut s = line(Group::Vehicle, "Autá") + &line(Group::Person, "Ľudia");
+        // rýchlosti (len ak sa merali)
+        for (g, label) in [(Group::Vehicle, "Autá"), (Group::Person, "Ľudia")] {
+            let v: Vec<f64> = self.events.iter().filter(|e| e.group == g).filter_map(|e| e.speed_kmh).collect();
+            if !v.is_empty() {
+                let avg = v.iter().sum::<f64>() / v.len() as f64;
+                let (min, max) = v.iter().fold((f64::MAX, f64::MIN), |(a, b), &x| (a.min(x), b.max(x)));
+                s += &format!("{label} – rýchlosť pri prechode: priemer {avg:.1} km/h, min {min:.1}, max {max:.1} ({} meraní)\n", v.len());
+            }
+        }
+        s
     }
 }
 
@@ -321,12 +355,28 @@ mod tests {
         walk(&mut c, 7, V, 100.0, 900.0, 20.0);
         let csv = c.events_csv();
         let mut lines = csv.lines();
-        assert_eq!(lines.next().unwrap(), "time_s,frame,track_id,group,direction");
+        assert_eq!(lines.next().unwrap(), "time_s,frame,track_id,group,direction,speed_kmh");
         let row = lines.next().unwrap();
-        assert!(row.ends_with(",7,auta,zlava_doprava"), "{row}");
+        assert!(row.ends_with(",7,auta,zlava_doprava,"), "bez rýchlosti je stĺpec prázdny: {row}");
         assert!(lines.next().is_none());
         let s = c.summary();
         assert!(s.contains("Autá: spolu 1") && s.contains("Ľudia: spolu 0"), "{s}");
+        assert!(!s.contains("rýchlosť"), "bez meraní sa rýchlosť nevypisuje: {s}");
+    }
+
+    #[test]
+    fn rychlost_v_csv_a_suhrne() {
+        let mut c = LineCounter::new(500.0, 10.0);
+        walk(&mut c, 1, V, 100.0, 900.0, 20.0);
+        c.set_last_speed(Some(42.04));
+        walk(&mut c, 2, V, 900.0, 100.0, -20.0);
+        c.set_last_speed(Some(30.0));
+        walk(&mut c, 3, P, 100.0, 900.0, 20.0);
+        assert_eq!(c.events()[0].speed_kmh, Some(42.04));
+        assert!(c.events_csv().lines().nth(1).unwrap().ends_with(",auta,zlava_doprava,42.0"));
+        let s = c.summary();
+        assert!(s.contains("Autá – rýchlosť pri prechode: priemer 36.0 km/h, min 30.0, max 42.0 (2 meraní)"), "{s}");
+        assert!(!s.contains("Ľudia – rýchlosť"), "{s}");
     }
 
     #[test]

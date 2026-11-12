@@ -140,7 +140,7 @@ fn spracuje_video_s_posunom_kamery_a_ulozi_vysledky() {
     assert!(Path::new(&format!("{out}/cam_reference.jpg")).exists());
     // CSV a súhrn
     let csv = std::fs::read_to_string(format!("{out}/cam_events.csv")).unwrap();
-    assert_eq!(csv.lines().next().unwrap(), "time_s,frame,track_id,group,direction");
+    assert_eq!(csv.lines().next().unwrap(), "time_s,frame,track_id,group,direction,speed_kmh");
     let summary = std::fs::read_to_string(format!("{out}/cam_summary.txt")).unwrap();
     assert!(summary.contains("Snímok: 160") && summary.contains("ukotvenie zapnuté"), "{summary}");
 }

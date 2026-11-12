@@ -21,6 +21,8 @@ use object_detect::{
     counter::{Group, COUNTED_CLASSES},
     detector::Detector,
     scene::{SceneConfig, SceneCounter},
+    speed::GroundModel,
+    dewarp::{DewarpParams, LazyDewarp},
     video_io, Result,
 };
 
@@ -31,7 +33,7 @@ fn main() -> Result<()> {
         raw.insert(0, "--input".into());
     }
     let args = parse_live_args_from(raw, None).map_err(|e| {
-        format!("{e}\npoužitie: video_count <video.mp4> [--line 0.5] [--line-span od,do] [--roi x,y,w,h] [--anchor on|off] [--conf 0.4] [--out-dir out] [--output video.mp4]")
+        format!("{e}\npoužitie: video_count <video.mp4> [--line 0.5] [--line-span od,do] [--roi x,y,w,h] [--anchor on|off] [--engine opencv|ort-cpu|coreml|coreml-gpu|coreml-ane] [--conf 0.4] [--speed calib/camera_model.json] [--dewarp calib/dewarp/dewarp.json] [--clean] [--out-dir out] [--output video.mp4]")
     })?;
     gst::init()?;
 
@@ -58,13 +60,17 @@ fn main() -> Result<()> {
             deadband: args.anchor_deadband,
         }),
         anchor_every: args.anchor_every,
+        ground: args.speed_model.as_deref().map(GroundModel::load).transpose()?,
+        clean: args.clean,
     };
 
     // model sa načíta hneď (chyba skôr než sa začne dekódovať video)
-    let mut detector = Some(Detector::yolo_with_classes(&args.model, args.conf, &COUNTED_CLASSES)?);
+    let mut detector = Some(Detector::yolo_with_classes_on(&args.model, args.conf, &COUNTED_CLASSES, args.engine)?);
     let (input_pipe, sink) = video_io::open_input(&input, args.detect_width)?;
     let mut scene: Option<SceneCounter> = None;
+    let mut dewarp = args.dewarp.as_deref().map(DewarpParams::load).transpose()?.map(LazyDewarp::new);
     let mut output = None;
+    let mut clock = object_detect::speed::FrameClock::new();
     // výstupný formát: rozmery zobrazeného záberu, snímková frekvencia z pôvodného videa
     let mut info_file: Option<gst_video::VideoInfo> = None;
     let start = Instant::now();
@@ -73,15 +79,23 @@ fn main() -> Result<()> {
         let buffer = sample.buffer().ok_or("snímka bez buffera")?;
         let info = gst_video::VideoInfo::from_caps(sample.caps().ok_or("snímka bez caps")?)?;
         let frame_hi = video_io::buffer_to_mat(buffer, &info)?;
+        // rovný obraz bez fisheye: všetko ďalej (detekcia, rýchlosť, kreslenie) beží na ňom
+        let frame_hi = match dewarp.as_mut() {
+            Some(d) => d.apply(&frame_hi)?,
+            None => frame_hi,
+        };
 
         if scene.is_none() {
-            let (sc, notes) = SceneCounter::new(detector.take().unwrap(), &cfg, &frame_hi)?;
+            let (mut sc, notes) = SceneCounter::new(detector.take().unwrap(), &cfg, &frame_hi)?;
+            if cfg.ground.is_some() {
+                sc.enable_track_log(); // polohy objektov pre analýzu rýchlosti (<názov>_tracks.csv)
+            }
             notes.iter().for_each(|n| eprintln!("{n}"));
             println!(
-                "video {}x{} -> výstup {}x{}, detekcia na {}x{} px, čiara pri {:.0} % šírky, ukotvenie {}",
+                "video {}x{} -> výstup {}x{}, detekcia na {}x{} px, čiara pri {:.0} % šírky, ukotvenie {}, výpočet siete {}",
                 info.width(), info.height(), sc.info_out().width(), sc.info_out().height(),
                 sc.roi_static().width, sc.roi_static().height, line * 100.0,
-                if sc.anchor().is_some() { "zapnuté" } else { "vypnuté" }
+                if sc.anchor().is_some() { "zapnuté" } else { "vypnuté" }, args.engine.name()
             );
             let o = sc.info_out();
             let fi = gst_video::VideoInfo::builder(gst_video::VideoFormat::Bgr, o.width(), o.height()).fps(info.fps()).build()?;
@@ -91,7 +105,8 @@ fn main() -> Result<()> {
         }
         let sc = scene.as_mut().unwrap();
 
-        let time_s = buffer.pts().map(|t| t.nseconds() as f64 / 1e9).unwrap_or(0.0);
+        // vyhladený čas snímky (záznamy z RTSP majú zhluky snímok s rovnakou značkou)
+        let time_s = clock.next(buffer.pts().map(|t| t.nseconds() as f64 / 1e9).unwrap_or(0.0));
         let mut step = sc.step(&frame_hi, time_s)?;
         for n in &step.notes {
             println!("[{time_s:6.1} s] {n}");
@@ -102,8 +117,8 @@ fn main() -> Result<()> {
         }
         for ev in &step.events {
             println!(
-                "[{time_s:6.1} s] {} {}  (autá {}, ľudia {})",
-                ev.group.name(), ev.direction.name(),
+                "[{:6.1} s] {} {}{}  (autá {}, ľudia {})",
+                ev.time_s, ev.group.name(), ev.direction.name(), ev.speed_text(),
                 sc.counter().total(Group::Vehicle), sc.counter().total(Group::Person)
             );
         }
@@ -126,11 +141,15 @@ fn main() -> Result<()> {
 
     let sc = scene.ok_or("video neobsahuje žiadne snímky")?;
     fs::write(format!("{}/{name}_events.csv", args.out_dir), sc.counter().events_csv())?;
+    if let Some(log) = sc.track_log_csv() {
+        fs::write(format!("{}/{name}_tracks.csv", args.out_dir), log)?;
+    }
     let summary = format!(
-        "Video: {input}\nSnímok: {}\nČiara: {:.0} % šírky záberu, ukotvenie {}\n\n{}",
+        "Video: {input}\nSnímok: {}\nČiara: {:.0} % šírky záberu, ukotvenie {}, rýchlosť {}\n\n{}",
         sc.frames(),
         line * 100.0,
         if sc.anchor().is_some() { "zapnuté" } else { "vypnuté" },
+        args.speed_model.as_deref().unwrap_or("nemeraná"),
         sc.counter().summary()
     );
     fs::write(format!("{}/{name}_summary.txt", args.out_dir), &summary)?;

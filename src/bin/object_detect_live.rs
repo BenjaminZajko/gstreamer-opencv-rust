@@ -27,10 +27,12 @@ use object_detect::{
     args::{parse_live_args, LiveArgs},
     counter::{CrossEvent, Group, LineCounter, COUNTED_CLASSES},
     detector::Detector,
+    dewarp::{DewarpParams, LazyDewarp},
     draw,
     live_count::Session,
     rtsp_out::{ensure_port_free, RtspOutput},
     scene::{SceneConfig, SceneCounter},
+    speed::GroundModel,
     video_io, Result,
 };
 
@@ -120,7 +122,7 @@ impl CountLog {
             counts_path: format!("{out_dir}/live_counts.txt"),
             started: now.format("%Y-%m-%d %H:%M:%S").to_string(),
         };
-        fs::write(&log.csv_path, "cas,track_id,skupina,smer,spolu_auta,spolu_ludia\n")?;
+        fs::write(&log.csv_path, "cas,track_id,skupina,smer,spolu_auta,spolu_ludia,rychlost_kmh\n")?;
         Ok(log)
     }
 
@@ -129,13 +131,14 @@ impl CountLog {
         let mut f = OpenOptions::new().append(true).open(&self.csv_path)?;
         writeln!(
             f,
-            "{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{}",
             chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
             ev.track,
             ev.group.name(),
             ev.direction.name(),
             c.total(Group::Vehicle),
-            c.total(Group::Person)
+            c.total(Group::Person),
+            ev.speed_kmh.map(|v| format!("{v:.1}")).unwrap_or_default()
         )?;
         self.write_counts(c)
     }
@@ -157,7 +160,7 @@ impl CountLog {
 /// Čiara a výrez sú ukotvené k scéne (modul `anchor`, pozri `scene::SceneCounter`).
 fn run_counting(args: &LiveArgs, line: f64) -> Result<()> {
     let log = CountLog::new(&args.out_dir)?;
-    let cfg = scene_config(args, line);
+    let cfg = scene_config(args, line)?;
 
     // všetko, čo závisí od rozmerov snímky, sa pripraví pri prvej snímke
     let mut scene: Option<(SceneCounter, RtspOutput)> = None;
@@ -172,20 +175,38 @@ fn run_counting(args: &LiveArgs, line: f64) -> Result<()> {
     // relácia diváka: panel a čísla objektov začínajú od nuly, keď sa pripojí divák
     let mut session: Option<Session> = None;
     let start = Instant::now();
+    let mut dewarp = args.dewarp.as_deref().map(DewarpParams::load).transpose()?.map(LazyDewarp::new);
 
     loop {
         match video_io::open_live_input(&args.input, args.codec, args.detect_width) {
             Ok((pipeline, sink)) => {
                 eprintln!("zdroj pripojený");
                 let (mut window_start, mut window_frames) = (Instant::now(), 0u32);
+                // oneskorenie snímky za reálnym časom (ms), na kontrolu, či nič nezaostáva
+                let (mut lag_sum, mut lag_max) = (0.0f64, 0.0f64);
+                // čas snímky: podľa časovej značky z kamery (nie podľa toho, kedy sme ju stihli
+                // spracovať – to kolíše a kazí rýchlosť), vyhladený (pozri FrameClock);
+                // po opätovnom pripojení plynie ďalej
+                let mut pts0: Option<(f64, f64)> = None;
+                let mut clock = object_detect::speed::FrameClock::new();
 
                 while let Ok(sample) = sink.pull_sample() {
                     let buffer = sample.buffer().ok_or("snímka bez buffera")?;
                     let info = gst_video::VideoInfo::from_caps(sample.caps().ok_or("snímka bez caps")?)?;
                     let frame_hi = video_io::buffer_to_mat(buffer, &info)?;
+        // rovný obraz bez fisheye: všetko ďalej (detekcia, rýchlosť, kreslenie) beží na ňom
+        let frame_hi = match dewarp.as_mut() {
+            Some(d) => d.apply(&frame_hi)?,
+            None => frame_hi,
+        };
+                    if let (Some(now), Some(pts)) = (pipeline.current_running_time(), buffer.pts()) {
+                        let lag = now.nseconds() as f64 / 1e6 - pts.nseconds() as f64 / 1e6;
+                        lag_sum += lag;
+                        lag_max = lag_max.max(lag);
+                    }
 
                     if scene.is_none() {
-                        let detector = Detector::yolo_with_classes(&args.model, args.conf, &COUNTED_CLASSES)?;
+                        let detector = Detector::yolo_with_classes_on(&args.model, args.conf, &COUNTED_CLASSES, args.engine)?;
                         let (sc, notes) = SceneCounter::new(detector, &cfg, &frame_hi)?;
                         notes.iter().for_each(|n| eprintln!("{n}"));
                         let output = RtspOutput::start(args.port, &args.mount, sc.info_out(), args.fps, args.bitrate)?;
@@ -203,7 +224,16 @@ fn run_counting(args: &LiveArgs, line: f64) -> Result<()> {
 
                     // 0) + 1) ukotvenie, detekcia na výreze, počítanie (vždy, aj keď sa nik nepozerá)
                     let frame_idx = sc.frames();
-                    let mut step = sc.step(&frame_hi, start.elapsed().as_secs_f64())?;
+                    let now_s = start.elapsed().as_secs_f64();
+                    let time_s = match buffer.pts() {
+                        Some(pts) => {
+                            let p = pts.nseconds() as f64 / 1e9;
+                            let (base, p0) = *pts0.get_or_insert((now_s, p));
+                            clock.next(base + (p - p0))
+                        }
+                        None => now_s,
+                    };
+                    let mut step = sc.step(&frame_hi, time_s)?;
                     step.notes.iter().for_each(|n| println!("{n}"));
                     if let Some(photo) = &step.reference_photo {
                         let path = format!("{}/anchor_reference.jpg", args.out_dir);
@@ -225,7 +255,7 @@ fn run_counting(args: &LiveArgs, line: f64) -> Result<()> {
                     }
                     for ev in &step.events {
                         log.record(ev, sc.counter())?;
-                        println!("{} {}  (autá {}, ľudia {})", ev.group.name(), ev.direction.name(),
+                        println!("{} {}{}  (autá {}, ľudia {})", ev.group.name(), ev.direction.name(), ev.speed_text(),
                             sc.counter().total(Group::Vehicle), sc.counter().total(Group::Person));
                     }
 
@@ -244,11 +274,14 @@ fn run_counting(args: &LiveArgs, line: f64) -> Result<()> {
                     }
 
                     window_frames += 1;
-                    if window_start.elapsed() >= Duration::from_secs(30) {
+                    if window_start.elapsed() >= Duration::from_secs(10) {
                         let fps = window_frames as f64 / window_start.elapsed().as_secs_f64();
                         let c = sc.counter();
-                        println!("{fps:.1} fps | autá {} | ľudia {}", c.total(Group::Vehicle), c.total(Group::Person));
-                        (window_start, window_frames) = (Instant::now(), 0);
+                        println!(
+                            "{fps:.1} fps | oneskorenie vstupu {:.0} ms (max {:.0}) | autá {} | ľudia {}",
+                            lag_sum / window_frames.max(1) as f64, lag_max, c.total(Group::Vehicle), c.total(Group::Person)
+                        );
+                        (window_start, window_frames, lag_sum, lag_max) = (Instant::now(), 0, 0.0, 0.0);
                     }
                 }
                 let _ = pipeline.set_state(gst::State::Null);
@@ -261,8 +294,9 @@ fn run_counting(args: &LiveArgs, line: f64) -> Result<()> {
 }
 
 /// Nastavenie počítania z argumentov.
-fn scene_config(args: &LiveArgs, line: f64) -> SceneConfig {
-    SceneConfig {
+fn scene_config(args: &LiveArgs, line: f64) -> Result<SceneConfig> {
+    let ground = args.speed_model.as_deref().map(GroundModel::load).transpose()?;
+    Ok(SceneConfig {
         line,
         line_span: args.line_span,
         roi: args.roi,
@@ -277,5 +311,7 @@ fn scene_config(args: &LiveArgs, line: f64) -> SceneConfig {
             deadband: args.anchor_deadband,
         }),
         anchor_every: args.anchor_every,
-    }
+        ground,
+        clean: args.clean,
+    })
 }

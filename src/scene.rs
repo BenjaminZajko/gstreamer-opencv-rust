@@ -15,12 +15,13 @@ use opencv::{
 use gstreamer_video as gst_video;
 
 use crate::{
-    anchor::{draw_points, rect_corners, render_reference, Anchor, AnchorConfig, AnchorMode},
+    anchor::{align_images, draw_points, rect_corners, render_reference, Anchor, AnchorConfig, AnchorMode, Homography},
     counter::{CountsView, CrossEvent, LineCounter},
     detector::Detector,
     draw::{self, Counted},
     live_count::{detect_in_roi, roi_from_quad, roi_rect, CountingCore},
     roi::Crop,
+    speed::{GroundMapper, GroundModel},
     Result,
 };
 
@@ -41,6 +42,11 @@ pub struct SceneConfig {
     pub anchor: Option<AnchorConfig>,
     /// ukotvenie sa prepočíta každú N-tú snímku
     pub anchor_every: u32,
+    /// model kamery na meranie rýchlosti (`None` = nemerať)
+    pub ground: Option<GroundModel>,
+    /// čistý obraz: kreslia sa len autá a ľudia s rýchlosťou (bez čiary, panelu a bodov);
+    /// počítanie a záznam prechodov bežia ďalej
+    pub clean: bool,
 }
 
 /// Výsledok spracovania jednej snímky.
@@ -74,7 +80,11 @@ pub struct SceneCounter {
     roi_ref_quad: [(f64, f64); 4],
     line_ref: ((f64, f64), (f64, f64)),
     ref_color: Option<Mat>,
+    /// referenčné body z merania (model rýchlosti) v súradniciach referencie
+    calib_pts: Vec<(u32, (f64, f64))>,
     prev_mode: AnchorMode,
+    /// čistý obraz (pozri `SceneConfig::clean`)
+    clean: bool,
     prev_keys: usize,
     was_tracking: bool,
     frames: u64,
@@ -112,9 +122,24 @@ impl SceneCounter {
         let r = roi_static;
         let roi_ref_quad = rect_corners(r.x as f64 * scale, r.y as f64 * scale, r.width as f64 * scale, r.height as f64 * scale);
         let line_x = cfg.line * out_w as f64;
+        let mut core = CountingCore::new(line_x, (y0 * out_h as f64, y1 * out_h as f64), cfg.margin, cfg.max_missed).with_strict_display();
+        // rýchlosť: sledovanie beží v súradniciach referencie (= výstupný záber pri štarte),
+        // model kamery je pre plné rozlíšenie snímky, z ktorej sa počítal
+        let mut calib_pts = vec![];
+        if let Some(m) = &cfg.ground {
+            let mut mapper = GroundMapper::new(m.clone(), out_w as f64, out_h as f64)?;
+            // kamera sa mohla od merania pootočiť: zarovnáme záber pri štarte so snímkou z merania
+            if let Some(path) = &m.snapshot {
+                let (h, note) = align_to_snapshot(first, path, out_size)?;
+                mapper = mapper.with_alignment(h);
+                notes.push(note);
+            }
+            calib_pts = mapper.points_in_ref();
+            core = core.with_speed(mapper);
+        }
         let sc = SceneCounter {
             detector,
-            core: CountingCore::new(line_x, (y0 * out_h as f64, y1 * out_h as f64), cfg.margin, cfg.max_missed),
+            core,
             prev_mode: anchor.as_ref().map(|a| a.mode()).unwrap_or(AnchorMode::OrbOnly),
             anchor,
             anchor_every: cfg.anchor_every.max(1),
@@ -125,6 +150,8 @@ impl SceneCounter {
             roi_ref_quad,
             line_ref: ((line_x, y0 * out_h as f64), (line_x, y1 * out_h as f64)),
             ref_color,
+            calib_pts,
+            clean: cfg.clean,
             prev_keys: 0,
             was_tracking: true,
             frames: 0,
@@ -138,6 +165,15 @@ impl SceneCounter {
 
     pub fn counter(&self) -> &LineCounter {
         self.core.counter()
+    }
+
+    /// Zapne záznam polôh objektov (pozri `CountingCore::enable_track_log`).
+    pub fn enable_track_log(&mut self) {
+        self.core.enable_track_log();
+    }
+
+    pub fn track_log_csv(&self) -> Option<&str> {
+        self.core.track_log_csv()
     }
 
     pub fn anchor(&self) -> Option<&Anchor> {
@@ -238,6 +274,10 @@ impl SceneCounter {
             Some(o) => o,
             None => resize(frame_hi, self.out_size)?,
         };
+        if self.clean {
+            draw::draw_objects(&mut out, items)?;
+            return Ok(out);
+        }
         match &self.anchor {
             Some(a) => {
                 // čiara sa presunie spolu so scénou (môže byť naklonená)
@@ -253,9 +293,69 @@ impl SceneCounter {
             }
             None => draw::draw_quad(&mut out, &step.quad)?,
         }
+        // referenčné body z merania (1–8): idú so scénou rovnako ako čiara
+        if !self.calib_pts.is_empty() {
+            let pts: Vec<(u32, (f64, f64))> = match &self.anchor {
+                Some(a) => self.calib_pts.iter().map(|&(id, p)| (id, a.to_current(p))).collect(),
+                None => self.calib_pts.clone(),
+            };
+            draw::draw_numbered_points(&mut out, &pts)?;
+        }
         draw::draw_counting(&mut out, items, &view)?;
         Ok(out)
     }
+}
+
+/// Šírka (px), na ktorej sa hľadá zarovnanie so snímkou z merania.
+const ALIGN_MAX_W: f64 = 1280.0;
+
+/// Zarovná prvú snímku so snímkou z merania. Vráti homografiu referencia -> snímka z merania
+/// (v rozlíšení `size`) a správu pre používateľa. Ak sa zarovnať nedá, použije sa identita.
+fn align_to_snapshot(first: &Mat, snapshot: &str, size: Size) -> Result<(Homography, String)> {
+    let snap = opencv::imgcodecs::imread(snapshot, opencv::imgcodecs::IMREAD_COLOR)?;
+    if snap.empty() {
+        return Ok((Homography::IDENTITY, format!("UPOZORNENIE: snímku z merania '{snapshot}' sa nepodarilo načítať, model rýchlosti sa nezarovnal")));
+    }
+    // ORB na zmenšenom zábere (najviac 1280 px) nájde viac stabilných zhôd než v plnom rozlíšení
+    // (pri inom osvetlení ich v plnom rozlíšení býva tesne pod hranicou)
+    let k = (ALIGN_MAX_W / size.width as f64).min(1.0);
+    let small = Size::new((size.width as f64 * k).round() as i32, (size.height as f64 * k).round() as i32);
+    let gray = |img: &Mat| -> Result<Mat> {
+        let mut g = Mat::default();
+        imgproc::cvt_color_def(&resize(img, small)?, &mut g, imgproc::COLOR_BGR2GRAY)?;
+        Ok(g)
+    };
+    let (a, b) = (gray(first)?, gray(&snap)?);
+    // robí sa raz pri štarte, takže sa oplatí skúsiť viac bodov a vziať výsledok s najviac
+    // zhodami (pri 3000 bodoch býva zhôd tesne nad minimom a zarovnanie je nepresné)
+    let mut found: Option<(Homography, usize)> = None;
+    for features in [3000, 12000] {
+        if let Some(r) = align_images(&a, &b, features, 25)? {
+            if found.as_ref().is_none_or(|f| r.1 > f.1) {
+                found = Some(r);
+            }
+        }
+    }
+    // homografia zo zmenšeného rozlíšenia späť do `size`
+    let scale = |hm: Homography| {
+        Homography([1.0 / k, 0.0, 0.0, 0.0, 1.0 / k, 0.0, 0.0, 0.0, 1.0])
+            .compose(&hm)
+            .compose(&Homography([k, 0.0, 0.0, 0.0, k, 0.0, 0.0, 0.0, 1.0]))
+    };
+    let (w, h) = (size.width as f64, size.height as f64);
+    Ok(match found.map(|(hm, n)| (scale(hm), n)) {
+        Some((hom, n)) => {
+            // priemerný posun vo vnútri záberu (rohy obrazu by ho zveličili)
+            let grid: Vec<(f64, f64)> =
+                [0.25, 0.5, 0.75].iter().flat_map(|&fx| [0.25, 0.5, 0.75].map(|fy| (fx * w, fy * h))).collect();
+            let shift = grid.iter().map(|&p| { let q = hom.apply(p); ((q.0 - p.0).powi(2) + (q.1 - p.1).powi(2)).sqrt() }).sum::<f64>() / grid.len() as f64;
+            (hom, format!("model rýchlosti zarovnaný so snímkou z merania ({n} zhodných bodov, kamera posunutá o {shift:.1} px)"))
+        }
+        None => (
+            Homography::IDENTITY,
+            "UPOZORNENIE: záber sa nepodarilo zarovnať so snímkou z merania (kamera sa veľmi otočila?), rýchlosť môže byť nepresná".into(),
+        ),
+    })
 }
 
 fn resize(img: &Mat, size: Size) -> Result<Mat> {

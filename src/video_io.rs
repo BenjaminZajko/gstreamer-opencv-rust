@@ -9,6 +9,9 @@ use opencv::{core, core::Mat, prelude::*};
 use crate::{roi::CropPixels, Result};
 
 /// Popis vstupnej pipeline pre súbor: dekódovanie -> (voliteľné orezanie) -> BGR -> zmenšenie.
+///
+/// `max-buffers=4` (bez zahadzovania): dekodér počká, kým sa snímky spracujú. Bez obmedzenia by
+/// rozbaľoval rýchlejšie, než stíha detekcia, a nespracované snímky by sa hromadili v pamäti.
 /// `videocrop` je element GStreameru, ktorý odreže zadaný počet pixelov z každej strany.
 ///
 /// Orezanie je PRED prevodom do BGR: tak sa prevádza len výrez, nie celý 4K snímok (zhruba 4x rýchlejšie).
@@ -22,7 +25,8 @@ pub fn file_input_pipeline(path: &str, width: i32, crop: Option<CropPixels>) -> 
     };
     format!(
         "filesrc location=\"{path}\" ! decodebin {crop}! videoconvert ! videoscale \
-         ! video/x-raw,format=BGR,width={width},pixel-aspect-ratio=1/1 ! appsink name=sink sync=false"
+         ! video/x-raw,format=BGR,width={width},pixel-aspect-ratio=1/1 \
+         ! appsink name=sink sync=false max-buffers=4"
     )
 }
 
@@ -85,10 +89,16 @@ pub enum Codec {
 /// Spoločný koniec vstupných pipeline: BGR, zmenšené na `width`, appsink ktorý zahadzuje staré
 /// snímky (max-buffers=1 drop=true), aby pri pomalšej detekcii nenarastalo oneskorenie.
 ///
+/// Pri živom zdroji (`sync=false`) je ešte PRED prevodom fronta, ktorá zahadzuje staré snímky
+/// (`leaky=downstream`): prevod 4K -> BGR je náročný a keď procesor nestíha (detekcia beží
+/// naraz), dekodér by inak čakal, snímky by sa hromadili v sieti a obraz by zaostával čoraz viac.
+/// Prevod beží na viacerých jadrách (`videoconvertscale n-threads=4`).
+///
 /// `sync=true` sa používa pre súbory: snímky prichádzajú v reálnom tempe videa (ako z kamery).
 fn bgr_tail(width: i32, sync: bool) -> String {
+    let drop_old = if sync { "" } else { "queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 leaky=downstream ! " };
     format!(
-        "videoconvert ! videoscale \
+        "{drop_old}videoconvertscale n-threads=4 \
          ! video/x-raw,format=BGR,width={width},pixel-aspect-ratio=1/1 \
          ! appsink name=sink sync={sync} max-buffers=1 drop=true"
     )
@@ -362,6 +372,9 @@ mod tests {
         assert!(d.contains("vtdec_hw"));
         assert!(d.contains("width=1280") && d.contains("format=BGR"));
         assert!(d.contains("drop=true") && d.contains("max-buffers=1"), "živý vstup nesmie hromadiť snímky");
+        // fronta zahadzujúca staré snímky musí byť pred náročným prevodom (za dekodérom)
+        let (q, conv) = (d.find("leaky=downstream").expect("leaky fronta"), d.find("videoconvertscale").unwrap());
+        assert!(d.find("vtdec_hw").unwrap() < q && q < conv, "{d}");
     }
 
     #[test]
@@ -428,5 +441,12 @@ mod tests {
         assert!(live_input_pipeline("file:", Codec::H265, 1280).is_err());
         gst::init().unwrap();
         gst::parse::launch(&d).unwrap();
+    }
+
+    #[test]
+    fn subor_ma_obmedzenu_frontu_bez_zahadzovania() {
+        let d = file_input_pipeline("/a/b.mp4", 1280, None);
+        assert!(d.contains("max-buffers=4"), "fronta snímok musí byť obmedzená: {d}");
+        assert!(!d.contains("drop=true"), "zo súboru sa nesmú zahadzovať snímky");
     }
 }

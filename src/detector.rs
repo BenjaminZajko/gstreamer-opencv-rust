@@ -68,8 +68,13 @@ impl Detector {
 
     /// YOLOX detektor, ktorý hľadá len vybrané triedy (čísla tried COCO, pozri `labels`).
     pub fn yolo_with_classes(model: &str, conf: f32, classes: &[usize]) -> Result<Self> {
+        Self::yolo_with_classes_on(model, conf, classes, crate::yolox::Engine::OpenCv)
+    }
+
+    /// To isté na zvolenom spôsobe výpočtu (OpenCV, ONNX Runtime, Core ML).
+    pub fn yolo_with_classes_on(model: &str, conf: f32, classes: &[usize], engine: crate::yolox::Engine) -> Result<Self> {
         Ok(Detector::Yolo {
-            net: Yolox::load(model, conf)?,
+            net: Yolox::load_with_engine(model, conf, engine)?,
             classes: Some(classes.to_vec()),
             people_label: false,
         })

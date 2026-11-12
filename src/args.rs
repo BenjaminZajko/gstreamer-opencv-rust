@@ -3,7 +3,7 @@
 
 use std::env;
 
-use crate::{roi::Crop, video_io::Codec, Result};
+use crate::{roi::Crop, video_io::Codec, yolox::Engine, Result};
 
 /// Režim detekcie, vyberá sa cez `--mode`.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -99,6 +99,10 @@ pub struct LiveArgs {
     pub anchor_deadband: f64,        // mŕtve pásmo v px: čiara sa nehýbe, kým sa kamera neposunie viac
     pub anchor_log: bool,            // zapisovať polohu čiary každú aktualizáciu do out/anchor_log.csv
     pub output: Option<String>,      // video_count: kam uložiť výsledné video
+    pub engine: Engine,              // na čom beží sieť (opencv, ort-cpu, coreml...)
+    pub speed_model: Option<String>, // model kamery (calib/camera_model.json) = zapnuté meranie rýchlosti
+    pub dewarp: Option<String>,      // rovný obraz bez fisheye (calib/dewarp/dewarp.json)
+    pub clean: bool,                 // čistý obraz: len autá a ľudia s rýchlosťou (bez čiary, panelu, bodov)
 }
 
 /// Argumenty živého režimu z príkazového riadku. Zdroj sa dá zadať aj cez premennú prostredia
@@ -140,6 +144,10 @@ pub fn parse_live_args_from<I: IntoIterator<Item = String>>(
         anchor_deadband: 1.0,
         anchor_log: false,
         output: None,
+        engine: Engine::OpenCv,
+        speed_model: None,
+        dewarp: None,
+        clean: false,
     };
     let mut input = None;
     while let Some(arg) = it.next() {
@@ -231,6 +239,10 @@ pub fn parse_live_args_from<I: IntoIterator<Item = String>>(
             }
             "--anchor-log" => a.anchor_log = true,
             "--output" => a.output = Some(val("--output")?),
+            "--engine" => a.engine = Engine::parse(&val("--engine")?)?,
+            "--speed" => a.speed_model = Some(val("--speed")?),
+            "--dewarp" => a.dewarp = Some(val("--dewarp")?),
+            "--clean" => a.clean = true,
             "--anchor-points" => {
                 a.anchor_points = val("--anchor-points")?.parse()?;
                 if a.anchor_points != 0 && a.anchor_points < 6 {
@@ -255,7 +267,7 @@ pub fn parse_live_args_from<I: IntoIterator<Item = String>>(
     a.input = input
         .or(env_input)
         .filter(|s| !s.is_empty())
-        .ok_or("použitie: object_detect_live --input rtsp://... (alebo premenná LIVE_INPUT) [--mode people] [--port 8554] [--mount /detect] [--codec h265|h264] [--width 1280] [--conf 0.4] [--fps 20] [--bitrate 4000] [--line 0.235 --line-span 0.52,0.85 --roi 0,0.52,0.47,0.33] [--anchor on|off] [--anchor-points 10]")?;
+        .ok_or("použitie: object_detect_live --input rtsp://... (alebo premenná LIVE_INPUT) [--mode people] [--port 8554] [--mount /detect] [--codec h265|h264] [--width 1280] [--conf 0.4] [--fps 20] [--bitrate 4000] [--line 0.235 --line-span 0.52,0.85 --roi 0,0.52,0.47,0.33] [--anchor on|off] [--anchor-points 10] [--speed calib/camera_model.json] [--dewarp calib/dewarp/dewarp.json] [--clean]")?;
     Ok(a)
 }
 
@@ -573,6 +585,34 @@ mod tests {
         assert_eq!((a.anchor_points, a.anchor_calib, a.anchor_deadband), (10, 12, 1.0));
         assert!(!a.anchor_log);
         assert_eq!(a.output, None);
+        assert_eq!(a.engine, Engine::OpenCv);
+    }
+
+    #[test]
+    fn live_engine() {
+        for (t, e) in [("opencv", Engine::OpenCv), ("ort-cpu", Engine::OrtCpu), ("coreml", Engine::CoreMl), ("coreml-gpu", Engine::CoreMlGpu), ("coreml-ane", Engine::CoreMlAne)] {
+            assert_eq!(live(&["--input", "x", "--engine", t]).unwrap().engine, e);
+        }
+        assert!(live(&["--input", "x", "--engine", "cuda"]).is_err());
+        assert!(live(&["--input", "x", "--engine"]).is_err());
+    }
+
+    #[test]
+    fn live_speed() {
+        assert_eq!(live(&["--input", "x"]).unwrap().speed_model, None);
+        let a = live(&["--input", "x", "--speed", "calib/camera_model.json"]).unwrap();
+        assert_eq!(a.speed_model.as_deref(), Some("calib/camera_model.json"));
+        assert!(live(&["--input", "x", "--speed"]).is_err());
+    }
+
+    #[test]
+    fn live_dewarp_a_cisty_obraz() {
+        let a = live(&["--input", "x"]).unwrap();
+        assert_eq!((a.dewarp, a.clean), (None, false));
+        let a = live(&["--input", "x", "--dewarp", "calib/dewarp/dewarp.json", "--clean"]).unwrap();
+        assert_eq!(a.dewarp.as_deref(), Some("calib/dewarp/dewarp.json"));
+        assert!(a.clean);
+        assert!(live(&["--input", "x", "--dewarp"]).is_err());
     }
 
     #[test]

@@ -89,7 +89,7 @@ fn vytvori_video_csv_a_suhrn_s_orezanim() {
     assert_eq!(n, 60);
 
     let csv = fs::read_to_string(format!("{out}/t_events.csv")).unwrap();
-    assert_eq!(csv.lines().next().unwrap(), "time_s,frame,track_id,group,direction");
+    assert_eq!(csv.lines().next().unwrap(), "time_s,frame,track_id,group,direction,speed_kmh");
     assert_eq!(csv.lines().count(), 1, "lopta nie je auto ani človek: žiadne udalosti");
 
     let summary = fs::read_to_string(format!("{out}/t_summary.txt")).unwrap();
