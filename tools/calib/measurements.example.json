@@ -1,0 +1,60 @@
+{
+  "popis": "VZOR – vymyslené hodnoty. Pixely bodov sú zo snímky z merania (calib/snapshot_4k.jpg, plné rozlíšenie).",
+  "width": 3840,
+  "height": 3.6,
+  "points": {
+    "1": [
+      700,
+      1250,
+      "roh múru oproti"
+    ],
+    "2": [
+      1600,
+      1270,
+      "stĺpik brány oproti"
+    ],
+    "3": [
+      3300,
+      1240,
+      "päta značky vpravo"
+    ],
+    "4": [
+      800,
+      1900,
+      "päta piliera vľavo dole"
+    ],
+    "5": [
+      1900,
+      2050,
+      "roh obrubníka v strede dole"
+    ],
+    "6": [
+      3000,
+      1800,
+      "kanál vpravo dole"
+    ]
+  },
+  "ground": {
+    "1": 21.5,
+    "2": 19.8,
+    "3": 23.9,
+    "4": 8.2,
+    "5": 7.1,
+    "6": 9.4
+  },
+  "slant": {
+    "5": 8.0
+  },
+  "pairs": [
+    [
+      "4",
+      "5",
+      3.8
+    ],
+    [
+      "1",
+      "2",
+      4.3
+    ]
+  ]
+}

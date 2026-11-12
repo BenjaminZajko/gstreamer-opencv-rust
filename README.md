@@ -131,7 +131,7 @@ sa zapíše do CSV (stĺpec `speed_kmh` / `rychlost_kmh`) a do súhrnu (priemer,
 ./target/release/video_count video.mp4 --line 0.5 --line-span 0.5,0.85 --roi 0,0.5,1,0.35 --speed calib/camera_model.json
 ./live.sh count      # live.sh pridá --speed sám, ak existuje calib/camera_model.json
 ```
-Model sa počíta z meraní na mieste (`calib/calibrate.py`: vzdialenosti referenčných bodov od kamery,
+Model sa počíta z meraní na mieste (`tools/calib/calibrate.py`, pozri „Kalibrácia kamery“: vzdialenosti referenčných bodov od kamery,
 výška kamery a pár vzdialeností medzi bodmi) a platí len pre tú polohu kamery, v ktorej sa merala.
 Ak sa kamera od merania pootočila, záber sa pri štarte sám zarovná so snímkou z merania
 (`calib/snapshot_4k.jpg`) a počas behu pohyb kamery vyrovnáva ukotvenie – čiara, referenčné body 1–8
@@ -160,20 +160,51 @@ vnútri väčšieho vozidla (okná autobusu ako „car“) sa zahodia.
 inak by rýchlosť pri zhluku vyskočila.
 
 ## Kalibrácia kamery (rýchlosť a rovný obraz)
-Robí sa raz pre danú kameru a miesto; výsledok je v `calib/` (v `.gitignore` – fotky okolia a merania).
-1. **Skreslenie objektívu z mriežky:** pred kameru sa dá mriežkovaný papier (čo najväčší, cez celý záber) a
-   z priemeru ~10 snímok sa nájdu čiary mriežky. Hľadá sa korekcia (k1, k2, stred), po ktorej sú rovné
-   (metóda rovných čiar, nezáleží na sklone papiera). Výsledok: čiary rovné na ~3 px (bez korekcie 23 px).
-2. **Merania na mieste (laser):** vzdialenosti od päty kamery k 6–8 bodom na zemi (blízko aj na druhej strane
-   ulice, vľavo aj vpravo), výška kamery a 1–2 vzdialenosti medzi bodmi. Z nich sa dopočíta ohnisko, sklon,
-   náklon a výška kamery.
-3. **Sklon automaticky z obrazu:** zo zvislých hrán (domy, stĺpy) v rovnom obraze sa nájde úbežník a z neho
-   sklon a náklon kamery – zhoda s meraním laserom do 0,3°.
-4. Z modelu sa pripraví rovný obraz (`calib/dewarp/`: `dewarp.json`, model rýchlosti, snímka z merania a body).
+Robí sa raz pre danú kameru a miesto. Skripty sú v `tools/calib/`, výsledky a merania v `calib/`
+(ten je v `.gitignore` – fotky okolia a merania sa nenahrávajú). Treba Python 3 s `numpy`, `scipy`, `Pillow`
+(`pip3 install numpy scipy pillow`) a `ffmpeg`.
 
-Overenie: moped s tachometrom na 26 km/h, 3 prejazdy → 25,2 / 26,6 / 26,0 km/h (chyba pod 1 % v priemere,
-jednotlivé prejazdy ±3 %). Bez korekcie fisheye bola chyba na okrajoch záberu až −50 %, s korekciou len z meraní
-laserom −6,5 %.
+**1. Skreslenie objektívu z mriežky.** Pred kameru daj mriežkovaný papier (čo najväčší, rovný, cez celý záber
+aj rohy; ideálne šachovnica alebo výrazné čiary). Kamera musí ostať na mieste.
+```bash
+tools/calib/capture.sh calib/grid 10
+python3 tools/calib/grid_distortion.py calib/grid/g_*.png --out calib/grid
+# dva hárky vedľa seba: pridaj --seam x_hore,x_dole (poloha spoja v px)
+```
+Skontroluj `calib/grid/grid_curves.jpg` (čiary musia sedieť na mriežke). Hľadá sa korekcia, po ktorej sú
+čiary rovné (nezáleží na sklone papiera); dobrý výsledok je pár px (bez korekcie ~20 px).
+
+**2. Snímka z merania a body.** Papier daj preč, nasnímaj ulicu a ulož ju ako `calib/snapshot_4k.jpg`:
+```bash
+tools/calib/capture.sh calib 1 snapshot && ffmpeg -i calib/snapshot_01.png -q:v 2 calib/snapshot_4k.jpg
+```
+Na snímke vyber 6–8 bodov na zemi (rohy obrubníkov, päty stĺpikov...) – blízko aj na druhej strane ulice,
+vľavo aj vpravo – a zapíš ich pixely.
+
+**3. Merania laserom** zapíš do `calib/measurements.json` (vzor `tools/calib/measurements.example.json`):
+vzdialenosť po zemi od päty kamery (bod pod kamerou) ku každému bodu, výšku kamery a 1–2 vzdialenosti
+medzi bodmi. Potom:
+```bash
+python3 tools/calib/calibrate.py calib/measurements.json --grid calib/grid/grid_result.json --out calib/camera_model.json
+```
+Vypíše ohnisko, sklon, náklon, výšku a odchýlku každého merania (meranie s odchýlkou nad 15 % je označené –
+pravdepodobne je zle zmerané, vyhoď ho). Bez `--grid` sa skreslenie odhadne len z meraní (na okrajoch menej presné).
+
+**4. Kontrola sklonu z obrazu a rovný obraz:**
+```bash
+python3 tools/calib/rectify.py calib/camera_model.json calib/snapshot_4k.jpg calib/kontrola   # sklon zo zvislých hrán
+python3 tools/calib/make_dewarp.py calib/camera_model.json calib/dewarp                       # pre live.sh
+```
+`rectify.py` nájde zvislé hrany (domy, stĺpy), z ich úbežníka vypočíta sklon a náklon kamery a porovná ich
+s meraním (pri nás zhoda do 0,3°); uloží aj vyrovnaný obraz. `make_dewarp.py` pripraví `calib/dewarp/`
+(prevod na rovný obraz bez čiernych okrajov, model rýchlosti, snímka a body), ktorý `live.sh count` použije sám.
+
+Koľko meraní treba (overené na 4 autách a mopede): 6–8 meraní po zemi + výška dáva odchýlku rýchlosti
+do ~1–4 %; 4 merania ~8 %; 1–3 merania sú nespoľahlivé (môžu náhodou sedieť na jednom mieste, inde nie).
+Laser priamo z kamery a vzdialenosti medzi vzdialenými bodmi pomáhajú najmenej.
+
+Overenie: moped s tachometrom na 26 km/h, 3 prejazdy → 25,2 / 26,6 / 26,0 km/h (priemer 25,9).
+Bez korekcie fisheye bola chyba na okrajoch záberu až −50 %, s korekciou len z meraní laserom −6,5 %.
 
 ## Počítanie prechodov cez čiaru zo súboru s pevným orezaním (`line_count`)
 Z videa sa orezá zadaná časť záberu (napr. len cesta), YOLOX nájde autá a ľudí, tracker im pridelí ID
