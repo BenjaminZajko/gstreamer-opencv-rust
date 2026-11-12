@@ -150,7 +150,19 @@ pub fn draw_counting(frame: &mut Mat, items: &[Counted], counts: &CountsView) ->
     Ok(())
 }
 
-/// Sledované objekty: rámček (farba podľa skupiny), názov a rýchlosť.
+/// Názov triedy na zobrazenie (bez diakritiky – písmo OpenCV ju nevie).
+pub fn display_label(label: &str) -> &str {
+    match label {
+        "car" => "auto",
+        "truck" => "nakladiak",
+        "bus" => "autobus",
+        "motorcycle" => "motorka",
+        "person" => "clovek",
+        other => other,
+    }
+}
+
+/// Sledované objekty: rámček (farba podľa skupiny), názov, číslo a rýchlosť na tmavom podklade.
 pub fn draw_objects(frame: &mut Mat, items: &[Counted]) -> Result<()> {
     for it in items {
         let color = match it.group {
@@ -158,25 +170,23 @@ pub fn draw_objects(frame: &mut Mat, items: &[Counted]) -> Result<()> {
             Group::Person => Scalar::new(0.0, 255.0, 0.0, 0.0),    // zelená
         };
         imgproc::rectangle(frame, it.rect, color, 2, imgproc::LINE_8, 0)?;
-        let mut text = match it.score {
-            Some(s) => format!("{} #{} {:.0}%", it.label, it.id, s * 100.0),
-            None => format!("{} #{}", it.label, it.id),
-        };
+        let mut text = format!("{} #{}", display_label(&it.label), it.id);
         // pomalšie než chôdza = stojí (1–2 km/h je len chvenie rámčeka), rýchlosť sa nepíše
         if let Some(v) = it.speed_kmh.filter(|v| *v >= MIN_SHOWN_KMH) {
-            text += &format!(" {v:.0} km/h");
+            text += &format!("  {v:.0} km/h");
         }
-        imgproc::put_text(
+        let mut base = 0;
+        let size = imgproc::get_text_size(&text, imgproc::FONT_HERSHEY_SIMPLEX, 0.6, 2, &mut base)?;
+        let org = Point::new(it.rect.x.max(0), (it.rect.y - 8).max(size.height + 4));
+        imgproc::rectangle(
             frame,
-            &text,
-            Point::new(it.rect.x, (it.rect.y - 6).max(14)),
-            imgproc::FONT_HERSHEY_SIMPLEX,
-            0.55,
-            color,
-            2,
-            imgproc::LINE_AA,
-            false,
+            Rect::new(org.x - 2, org.y - size.height - 4, size.width + 6, size.height + base + 6),
+            Scalar::all(0.0),
+            imgproc::FILLED,
+            imgproc::LINE_8,
+            0,
         )?;
+        imgproc::put_text(frame, &text, org, imgproc::FONT_HERSHEY_SIMPLEX, 0.6, color, 2, imgproc::LINE_AA, false)?;
     }
     Ok(())
 }
@@ -207,6 +217,17 @@ pub fn draw_quad(frame: &mut Mat, quad: &[(f64, f64); 4]) -> Result<()> {
         quad.iter().map(|p| Point::new(p.0.round() as i32, p.1.round() as i32)).collect();
     imgproc::polylines(frame, &pts, true, Scalar::all(170.0), 1, imgproc::LINE_8, 0)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests_labels {
+    #[test]
+    fn nazvy_su_po_slovensky_bez_diakritiky() {
+        assert_eq!(super::display_label("car"), "auto");
+        assert_eq!(super::display_label("motorcycle"), "motorka");
+        assert_eq!(super::display_label("person"), "clovek");
+        assert_eq!(super::display_label("dog"), "dog");
+    }
 }
 
 #[cfg(test)]

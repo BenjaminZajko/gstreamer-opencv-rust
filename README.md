@@ -147,12 +147,16 @@ cez polohy za posledných 1,2 s. Priečinok `calib/` je v `.gitignore` (obsahuje
 - **Čistý pohľad:** v obraze sú len rámčeky áut a ľudí s rýchlosťou – bez čiary, panelu a bodov.
   Prechody sa ďalej zapisujú do `out/`.
 - Vypnutie: `DEWARP= ./live.sh count` (pôvodný obraz), `CLEAN=0 ./live.sh count` (čiara a počty v obraze).
-- Pri rovnom obraze sú predvolené `ROI=0,0.27,1,0.37` a pásmo čiary `0.33,0.62` (dá sa zmeniť premennými
+- Pri rovnom obraze sú predvolené `ROI=0,0.36,1,0.42` a pásmo čiary `0.5,0.78` (dá sa zmeniť premennými
   `ROI` a `SPAN_DW`).
 - Obrázok sa dá previesť aj ručne: `cargo run --release --example dewarp_image -- calib/dewarp/dewarp.json vstup.jpg vystup.jpg`.
 
 Čo sa kreslí: objekt až po 3 detekciách (jednorazové omyly siete sa neukážu), „vozidlo“, ktoré sa nepohlo,
 sa po 2 s skryje (skrinka, zaparkované auto) a „človek“ sa ukáže až keď sa pohne (ozdoby brány).
+Jazdec na motorke / mopede je jeden objekt „motorka“ (sieť nájde človeka aj motorku – spoja sa, a keď
+motorku na chvíľu zakryje múr, jazdec ostane tou istou motorkou); rýchlosť sa meria od kolies, nie od nôh
+jazdca (tie sú ~30 cm nad zemou, čo by rýchlosť zvýšilo o ~7 %). Pomalé objekty (pod 15 km/h) majú rýchlosť
+z dlhšieho okna (2,4 s) a skoky rámčeka sa pri výpočte vynechajú. Popisy sú po slovensky na tmavom podklade.
 Kúsky jedného vozidla z rôznych častí výrezu sa spájajú aj keď ich sieť nazve inak (bus/truck) a menšie rámčeky
 vnútri väčšieho vozidla (okná autobusu ako „car“) sa zahodia.
 
@@ -182,7 +186,7 @@ Na snímke vyber 6–8 bodov na zemi (rohy obrubníkov, päty stĺpikov...) – 
 vľavo aj vpravo – a zapíš ich pixely.
 
 **3. Merania laserom** zapíš do `calib/measurements.json` (vzor `tools/calib/measurements.example.json`):
-vzdialenosť po zemi od päty kamery (bod pod kamerou) ku každému bodu, výšku kamery a 1–2 vzdialenosti
+vzdialenosť po zemi od päty kamery (bod pod kamerou) ku každému bodu, výšku kamery (`camera_height`) a 1–2 vzdialenosti
 medzi bodmi. Potom:
 ```bash
 python3 tools/calib/calibrate.py calib/measurements.json --grid calib/grid/grid_result.json --out calib/camera_model.json
@@ -203,7 +207,9 @@ Koľko meraní treba (overené na 4 autách a mopede): 6–8 meraní po zemi + v
 do ~1–4 %; 4 merania ~8 %; 1–3 merania sú nespoľahlivé (môžu náhodou sedieť na jednom mieste, inde nie).
 Laser priamo z kamery a vzdialenosti medzi vzdialenými bodmi pomáhajú najmenej.
 
-Overenie: moped s tachometrom na 26 km/h, 3 prejazdy → 25,2 / 26,6 / 26,0 km/h (priemer 25,9).
+Overenie: moped s tachometrom, 7 prejazdov pri 10–26 km/h (kamera vo výške 4,57 m) – rýchlosť z kamery je
+pri všetkých rýchlostiach 94 % ± 2 % hodnoty na tachometri (tachometre ukazujú typicky o 5–10 % viac),
+dĺžka áut z modelu 4,5–5,4 m. Bez novej kalibrácie po posunutí kamery by rýchlosti boli o 13 % vyššie.
 Bez korekcie fisheye bola chyba na okrajoch záberu až −50 %, s korekciou len z meraní laserom −6,5 %.
 
 ## Počítanie prechodov cez čiaru zo súboru s pevným orezaním (`line_count`)
@@ -242,6 +248,6 @@ na presnosť je malý. Hlavná záťaž je samotná sieť YOLOX (~84 ms na sním
 ```bash
 cargo test --release
 ```
-Unit testy (255), testy počítania (10) a e2e testy: súbory (8), živý server a počítanie (13), `line_count` (8), ukotvenie (5), `video_count` (5). Testy s modelom sa bez neho preskočia.
+Unit testy (262), testy počítania (10) a e2e testy: súbory (8), živý server a počítanie (13), `line_count` (8), ukotvenie (5), `video_count` (5). Testy s modelom sa bez neho preskočia.
 
 Poznámka: projekt používa OpenCV 5 (crate `opencv` 0.101), kde sú niektoré funkcie v iných moduloch než v OpenCV 4.

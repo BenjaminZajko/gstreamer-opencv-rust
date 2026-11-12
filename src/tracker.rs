@@ -51,6 +51,13 @@ impl Tracker {
         Self { tracks: vec![], next_id: 1, max_missed }
     }
 
+    /// Zmení skupinu objektu (napr. "človek" sa ukázal byť jazdcom na motorke).
+    pub fn set_group(&mut self, id: u32, group: Group) {
+        if let Some(t) = self.tracks.iter_mut().find(|t| t.id == id) {
+            t.group = group;
+        }
+    }
+
     /// Aktuálne sledované objekty.
     pub fn tracks(&self) -> &[Track] {
         &self.tracks

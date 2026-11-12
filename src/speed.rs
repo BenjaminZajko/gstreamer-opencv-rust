@@ -119,6 +119,13 @@ pub fn parse_points(csv: &str) -> Vec<(u32, f64, f64)> {
 
 /// Za aké obdobie sa počíta rýchlosť (s). Kratšie = rýchlejšia reakcia, dlhšie = menej šumu.
 pub const WINDOW_S: f64 = 1.2;
+/// Pomalé objekty (chodec, pomalý bicykel): rýchlosť pod SLOW_KMH sa počíta z dlhšieho okna
+/// LONG_WINDOW_S – pri malom posune za 1,2 s by chvenie rámčeka spravilo z 10 km/h aj 20.
+pub const LONG_WINDOW_S: f64 = 2.4;
+const SLOW_KMH: f64 = 15.0;
+/// Bod ďalej od priamky než toto (m, a zároveň 3x typická odchýlka) sa pri výpočte vynechá –
+/// skok rámčeka (zakrytie pilierom, spojenie s iným objektom).
+const OUTLIER_M: f64 = 0.25;
 /// Najkratší úsek, z ktorého sa rýchlosť ešte ukáže (s).
 const MIN_SPAN_S: f64 = 0.5;
 /// Najmenej vzoriek v okne.
@@ -159,6 +166,30 @@ fn slope(h: &[&Sample], f: impl Fn(&Sample) -> (f64, f64)) -> (f64, f64) {
     (stx / stt, sty / stt)
 }
 
+/// To isté, ale body, ktoré sú od priamky ďaleko (skok rámčeka), sa vynechajú a priamka sa
+/// preloží znova.
+fn robust_slope(h: &[&Sample], f: impl Fn(&Sample) -> (f64, f64) + Copy) -> (f64, f64) {
+    let (vx, vy) = slope(h, f);
+    let n = h.len() as f64;
+    let mt = h.iter().map(|s| s.0).sum::<f64>() / n;
+    let (mx, my) = (h.iter().map(|s| f(s).0).sum::<f64>() / n, h.iter().map(|s| f(s).1).sum::<f64>() / n);
+    let res: Vec<f64> = h
+        .iter()
+        .map(|s| {
+            let (x, y) = f(s);
+            ((x - mx - vx * (s.0 - mt)).powi(2) + (y - my - vy * (s.0 - mt)).powi(2)).sqrt()
+        })
+        .collect();
+    let mut sorted = res.clone();
+    sorted.sort_by(f64::total_cmp);
+    let limit = OUTLIER_M.max(3.0 * sorted[sorted.len() / 2]);
+    let kept: Vec<&Sample> = h.iter().zip(&res).filter(|(_, r)| **r <= limit).map(|(s, _)| *s).collect();
+    if kept.len() == h.len() || kept.len() < MIN_SAMPLES {
+        return (vx, vy);
+    }
+    slope(&kept, f)
+}
+
 impl SpeedTracker {
     pub fn new() -> Self {
         Self::default()
@@ -183,24 +214,38 @@ impl SpeedTracker {
             }
         }
         h.push((t, left, right, size));
-        h.retain(|s| t - s.0 <= WINDOW_S);
+        h.retain(|s| t - s.0 <= LONG_WINDOW_S);
         self.speed(id)
     }
 
     /// Rýchlosť (km/h) z priamky preloženej polohami v okne (metóda najmenších štvorcov),
-    /// takže jednotlivé roztrasené rámčeky ju veľmi neovplyvnia.
+    /// takže jednotlivé roztrasené rámčeky ju veľmi neovplyvnia. Okno je WINDOW_S; ak je objekt
+    /// pomalý (pod SLOW_KMH), použije sa dlhšie okno LONG_WINDOW_S.
     pub fn speed(&self, id: u32) -> Option<f64> {
         let all = self.history.get(&id)?;
+        let t_last = all.last()?.0;
+        let short = Self::speed_over(all, t_last - WINDOW_S);
+        match short {
+            Some(v) if v < SLOW_KMH => Self::speed_over(all, t_last - LONG_WINDOW_S).or(short),
+            _ => short,
+        }
+    }
+
+    fn speed_over(all: &[Sample], from: f64) -> Option<f64> {
+        let win: Vec<&Sample> = all.iter().filter(|s| s.0 >= from - 1e-9).collect();
+        if win.is_empty() {
+            return None;
+        }
         // len vzorky s "normálnou" výškou rámčeka (medián v okne)
-        let mut sizes: Vec<f64> = all.iter().map(|s| s.3).collect();
+        let mut sizes: Vec<f64> = win.iter().map(|s| s.3).collect();
         sizes.sort_by(f64::total_cmp);
         let med = sizes[sizes.len() / 2];
-        let h: Vec<&Sample> = all.iter().filter(|s| (s.3 - med).abs() <= SIZE_TOL * med).collect();
+        let h: Vec<&Sample> = win.into_iter().filter(|s| (s.3 - med).abs() <= SIZE_TOL * med).collect();
         if h.len() < MIN_SAMPLES || h.last()?.0 - h.first()?.0 < MIN_SPAN_S {
             return None;
         }
-        let (lx, ly) = slope(&h, |s| s.1);
-        let (rx, ry) = slope(&h, |s| s.2);
+        let (lx, ly) = robust_slope(&h, |s| s.1);
+        let (rx, ry) = robust_slope(&h, |s| s.2);
         Some((lx * lx + ly * ly).sqrt().max((rx * rx + ry * ry).sqrt()) * 3.6)
     }
 
@@ -333,6 +378,47 @@ mod tests_clock {
             let t = i as f64 * 0.05;
             assert!((c.next(t) - t).abs() < 1e-9);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests_robust {
+    use super::*;
+
+    #[test]
+    fn pomaly_objekt_so_skokmi_ramceka_ma_stabilnu_rychlost() {
+        // 10 km/h (2,78 m/s), 20 fps; každá 7. snímka má rámček o 0,8 m vedľa (zakrytie)
+        let mut st = SpeedTracker::new();
+        let mut vals = vec![];
+        for i in 0..80 {
+            let t = i as f64 * 0.05;
+            let mut x = 2.78 * t;
+            if i % 7 == 3 {
+                x += 0.8;
+            }
+            if let Some(v) = st.observe_box(1, t, (x, 10.0), (x + 1.8, 10.0), 60.0) {
+                if t > 2.5 {
+                    vals.push(v);
+                }
+            }
+        }
+        let (lo, hi) = vals.iter().fold((f64::MAX, f64::MIN), |(a, b), v| (a.min(*v), b.max(*v)));
+        assert!(lo > 9.0 && hi < 11.0, "{lo} {hi}");
+    }
+
+    #[test]
+    fn rychly_objekt_pouziva_kratke_okno() {
+        // auto zrýchli z 30 na 50 km/h: po 1,2 s musí ukazovať blízko 50 (nie priemer 2,4 s)
+        let mut st = SpeedTracker::new();
+        let (mut x, mut v) = (0.0, None);
+        for i in 0..80 {
+            let t = i as f64 * 0.05;
+            let speed = if t < 2.0 { 30.0 / 3.6 } else { 50.0 / 3.6 };
+            x += speed * 0.05;
+            v = st.observe_box(1, t, (x, 10.0), (x + 4.0, 10.0), 80.0).or(v);
+        }
+        let v = v.unwrap();
+        assert!((v - 50.0).abs() < 2.0, "{v}");
     }
 }
 

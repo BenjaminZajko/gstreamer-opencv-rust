@@ -8,7 +8,7 @@ z merania a vzdialenosti v metroch:
   "ground": vzdialenosť po zemi od päty kamery (bod pod kamerou) k bodu,
   "slant":  vzdialenosť od kamery (laser priamo z kamery) k bodu,
   "pairs":  vzdialenosť medzi dvoma bodmi,
-  "height": výška kamery nad zemou.
+  "camera_height": výška kamery nad zemou (m; "width"/"height" sú rozmery snímky v px).
 
 Odporúčanie (z overovania): 6–8 meraní po zemi od päty kamery, blízko aj na druhej strane ulice,
 vľavo aj vpravo, + výška kamery. Pri 1–3 meraniach model náhodou sedí na jednom mieste, inde nie.
@@ -40,7 +40,7 @@ DESC = {k: (v[2] if len(v) > 2 else "") for k, v in M["points"].items()}
 GROUND = {str(k): v for k, v in M.get("ground", {}).items()}
 SLANT = {str(k): v for k, v in M.get("slant", {}).items()}
 PAIRS = [(str(a), str(b), d) for a, b, d in M.get("pairs", [])]
-HEIGHT = M.get("height")
+HEIGHT = M.get("camera_height")
 
 def ground_xy(q, u, v):
     f, k1, k2, pitch, roll, h, cx, cy = q

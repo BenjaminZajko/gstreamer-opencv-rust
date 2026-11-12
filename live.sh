@@ -22,8 +22,8 @@ SPAN="${SPAN:-0.5,0.85}"        # pásmo výšky, v ktorom sa počíta
 # rovný obraz bez fisheye (calib/make_dewarp.py); DEWARP= (prázdne) = pôvodný fisheye obraz
 DEWARP="${DEWARP-$DIR/calib/dewarp/dewarp.json}"
 if [ -n "$DEWARP" ] && [ -f "$DEWARP" ]; then
-  ROI="${ROI:-0,0.27,1,0.37}"   # výrez v rovnom obraze: pás s ulicou (aj strecha autobusu)
-  SPAN="${SPAN_DW:-0.33,0.62}"  # pásmo čiary v rovnom obraze (cesta)
+  ROI="${ROI:-0,0.36,1,0.42}"   # výrez v rovnom obraze: pás s ulicou (aj strecha autobusu)
+  SPAN="${SPAN_DW:-0.5,0.78}"   # pásmo čiary v rovnom obraze (cesta)
   SPEED_MODEL="${SPEED_MODEL:-$(dirname "$DEWARP")/camera_model.json}"
 else
   DEWARP=""

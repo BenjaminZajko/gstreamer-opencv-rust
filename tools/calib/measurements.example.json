@@ -1,7 +1,7 @@
 {
   "popis": "VZOR – vymyslené hodnoty. Pixely bodov sú zo snímky z merania (calib/snapshot_4k.jpg, plné rozlíšenie).",
   "width": 3840,
-  "height": 3.6,
+  "height": 2160,
   "points": {
     "1": [
       700,
@@ -56,5 +56,6 @@
       "2",
       4.3
     ]
-  ]
+  ],
+  "camera_height": 3.6
 }

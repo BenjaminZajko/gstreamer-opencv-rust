@@ -113,6 +113,59 @@ impl CountingCore {
         self.track_and_count_with(dets, frame_idx, time_s, |r| r)
     }
 
+    /// Jazdec na motorke ostane jedným objektom, aj keď ho sieť chvíľu vidí len ako človeka
+    /// (motorku zakryje múr / oblúk) alebo len ako motorku:
+    ///  - "človek" na mieste, kde sa práve pohybuje sledovaná motorka, je jej jazdec – dostane
+    ///    názov "motorcycle" a pokračuje tá istá stopa,
+    ///  - keď sa motorka (s jazdcom) objaví na mieste sledovaného "človeka", stopa sa preradí
+    ///    medzi vozidlá (ID ostane).
+    fn stick_riders(&mut self, dets: &[Detection], to_ref: &impl Fn(Rect) -> Rect) -> Vec<Detection> {
+        let mut out = dets.to_vec();
+        let near = |r: Rect, t: Rect| {
+            let overlap = (r.x + r.width).min(t.x + t.width) - r.x.max(t.x);
+            let cy = r.y + r.height / 2;
+            overlap as f64 >= 0.4 * r.width.min(t.width) as f64 && cy >= t.y - t.height && cy <= t.y + 2 * t.height
+        };
+        // pohybujúce sa motorky, ktoré sa nedávno videli
+        let bikes: Vec<Rect> = self
+            .tracker
+            .tracks()
+            .iter()
+            .filter(|t| t.group == Group::Vehicle && t.missed <= COAST_FRAMES)
+            .filter(|t| self.last_items.get(&t.id).is_some_and(|it| it.label == "motorcycle"))
+            .filter(|t| self.motion.get(&t.id).is_some_and(|m| m.2))
+            .map(|t| {
+                let k = (t.missed + 1) as f64;
+                let mut r = t.rect;
+                r.x += (t.vel.0 * k).round() as i32;
+                r.y += (t.vel.1 * k).round() as i32;
+                r
+            })
+            .collect();
+        for d in out.iter_mut() {
+            if d.label == "person" && bikes.iter().any(|&b| near(to_ref(d.rect), b)) {
+                d.label = "motorcycle".into();
+            }
+        }
+        // motorka na mieste sledovaného človeka: ten človek je jej jazdec
+        let people: Vec<(u32, Rect)> = self
+            .tracker
+            .tracks()
+            .iter()
+            .filter(|t| t.group == Group::Person && t.missed <= 2)
+            .map(|t| (t.id, t.rect))
+            .collect();
+        for d in out.iter().filter(|d| d.label == "motorcycle" && d.score.is_none_or(|s| s >= VEHICLE_MIN_CONF)) {
+            let r = to_ref(d.rect);
+            for &(id, p) in &people {
+                if near(p, r) {
+                    self.tracker.set_group(id, Group::Vehicle);
+                }
+            }
+        }
+        out
+    }
+
     /// To isté, ale sledovanie a počítanie prebieha v iných súradniciach než zobrazenie:
     /// `to_ref` prevedie rámček z aktuálnej snímky do súradníc referencie (kam je ukotvená
     /// čiara). Vrátené objekty majú pôvodný rámček (kvôli kresleniu).
@@ -123,6 +176,7 @@ impl CountingCore {
         time_s: f64,
         to_ref: impl Fn(Rect) -> Rect,
     ) -> (Vec<Counted>, Vec<CrossEvent>) {
+        let dets = self.stick_riders(dets, &to_ref);
         let counted: Vec<_> = dets
             .iter()
             .filter_map(|d| group_of(&d.label).map(|g| (d, g)))
@@ -352,7 +406,62 @@ pub fn detect_in_roi(detector: &mut Detector, frame_hi: &Mat, roi: Rect, scale: 
             all.push(TileDet { det: Detection { rect: to_output_coords(d.rect, *tile, scale), ..d }, cut_left, cut_right });
         }
     }
-    Ok(merge_tiles(all))
+    Ok(merge_riders(merge_tiles(all)))
+}
+
+/// Jazdec na motorke / mopede: sieť nájde "person" aj "motorcycle" – to je jeden objekt.
+/// Človek, ktorý sedí na motorke (prekrývajú sa vodorovne a spodok človeka je v motorke),
+/// sa spojí s ňou do jedného rámčeka "motorcycle" (vozidlo, rýchlosť od kolies).
+/// Motorka sa spojí aj s nízkou istotou – jazdec nad ňou ju potvrdzuje; spojený objekt dostane
+/// vyššiu z oboch istôt. Motorka bez jazdca s nízkou istotou sa neskôr zahodí (VEHICLE_MIN_CONF).
+pub fn merge_riders(dets: Vec<Detection>) -> Vec<Detection> {
+    let is_bike = |d: &Detection| d.label == "motorcycle";
+    let mut out: Vec<Detection> = vec![];
+    let mut riders = vec![false; dets.len()];
+    let bikes: Vec<usize> = (0..dets.len()).filter(|&i| is_bike(&dets[i])).collect();
+    for &b in &bikes {
+        let m = dets[b].rect;
+        for (i, p) in dets.iter().enumerate() {
+            if riders[i] || p.label != "person" {
+                continue;
+            }
+            let r = p.rect;
+            let overlap = (r.x + r.width).min(m.x + m.width) - r.x.max(m.x);
+            let bottom = r.y + r.height;
+            let sits = bottom >= m.y + m.height / 4 && bottom <= m.y + m.height + m.height / 2;
+            if overlap as f64 >= 0.4 * r.width as f64 && sits {
+                riders[i] = true;
+            }
+        }
+    }
+    for (i, d) in dets.iter().enumerate() {
+        if riders[i] {
+            continue;
+        }
+        if bikes.contains(&i) {
+            // rámček cez motorku aj jazdcov
+            let mut rect = d.rect;
+            let mut score = d.score;
+            for (j, p) in dets.iter().enumerate() {
+                if riders[j] {
+                    let m = d.rect;
+                    let r = p.rect;
+                    let overlap = (r.x + r.width).min(m.x + m.width) - r.x.max(m.x);
+                    if overlap as f64 >= 0.4 * r.width as f64 {
+                        rect = union(rect, r);
+                        score = match (score, p.score) {
+                            (Some(a), Some(b)) => Some(a.max(b)),
+                            (a, b) => a.or(b),
+                        };
+                    }
+                }
+            }
+            out.push(Detection { rect, label: d.label.clone(), score });
+        } else {
+            out.push(d.clone());
+        }
+    }
+    out
 }
 
 /// Ako blízko okraja časti (px) sa rámček považuje za odrezaný.
@@ -496,6 +605,68 @@ mod tests {
         ]);
         assert_eq!(out.len(), 1, "{out:?}");
         assert_eq!((out[0].label.as_str(), out[0].rect.x, out[0].rect.width), ("bus", 0, 900));
+    }
+
+    #[test]
+    fn jazdec_na_mopede_je_jeden_objekt() {
+        let d = |label: &str, x, y, w, h, s| Detection { rect: Rect::new(x, y, w, h), label: label.into(), score: Some(s) };
+        // moped (spodok) a jazdec nad ním, prekrývajú sa
+        let out = merge_riders(vec![d("motorcycle", 100, 160, 90, 60, 0.7), d("person", 115, 100, 50, 100, 0.9), d("person", 400, 100, 40, 110, 0.8)]);
+        assert_eq!(out.len(), 2, "{out:?}");
+        let bike = out.iter().find(|o| o.label == "motorcycle").unwrap();
+        assert_eq!((bike.rect.y, bike.rect.y + bike.rect.height), (100, 220));
+        assert!(out.iter().any(|o| o.label == "person" && o.rect.x == 400), "chodec vedľa ostane");
+        // motorka s nízkou istotou sa s jazdcom spojí a dostane jeho istotu
+        let out = merge_riders(vec![d("motorcycle", 100, 160, 90, 60, 0.2), d("person", 115, 100, 50, 100, 0.9)]);
+        assert_eq!(out.len(), 1);
+        assert_eq!((out[0].label.as_str(), out[0].score), ("motorcycle", Some(0.9)));
+        // človek stojaci za motorkou (spodok vysoko nad ňou) sa nespája
+        let out = merge_riders(vec![d("motorcycle", 100, 300, 90, 60, 0.7), d("person", 115, 100, 50, 100, 0.9)]);
+        assert_eq!(out.len(), 2);
+    }
+
+    #[test]
+    fn jazdec_za_mursom_ostane_motorkou() {
+        // moped ide doprava; po pár snímkach z neho sieť vidí len jazdca (motorku zakryl múr)
+        let mut core = CountingCore::new(500.0, (0.0, 1000.0), 10.0, 8);
+        let d = |label: &str, x: i32, y: i32, w, h| Detection { rect: Rect::new(x, y, w, h), label: label.into(), score: Some(0.9) };
+        let mut ids = std::collections::HashSet::new();
+        for f in 0..30u64 {
+            let x = 100 + 15 * f as i32;
+            let det = if f < 10 || f > 20 { d("motorcycle", x, 100, 90, 120) } else { d("person", x + 20, 100, 50, 70) };
+            let (items, _) = core.track_and_count(&[det], f, f as f64 / 20.0);
+            for it in items {
+                assert_eq!(it.group, Group::Vehicle, "snímka {f}");
+                ids.insert(it.id);
+            }
+        }
+        assert_eq!(ids.len(), 1, "jedna stopa: {ids:?}");
+    }
+
+    #[test]
+    fn jazdec_najprv_ako_clovek_potom_s_motorkou_ma_jedno_id() {
+        let mut core = CountingCore::new(500.0, (0.0, 1000.0), 10.0, 8);
+        let d = |label: &str, x: i32, y: i32, w, h| Detection { rect: Rect::new(x, y, w, h), label: label.into(), score: Some(0.9) };
+        let mut ids = std::collections::HashSet::new();
+        for f in 0..20u64 {
+            let x = 100 + 15 * f as i32;
+            let det = if f < 8 { d("person", x + 20, 100, 50, 70) } else { d("motorcycle", x, 100, 90, 120) };
+            let (items, _) = core.track_and_count(&[det], f, f as f64 / 20.0);
+            ids.extend(items.iter().map(|it| it.id));
+        }
+        assert_eq!(ids.len(), 1, "{ids:?}");
+    }
+
+    #[test]
+    fn chodec_vedla_zaparkovanej_motorky_ostane_clovekom() {
+        let mut core = CountingCore::new(500.0, (0.0, 1000.0), 10.0, 8);
+        let d = |label: &str, x: i32, y: i32, w, h| Detection { rect: Rect::new(x, y, w, h), label: label.into(), score: Some(0.9) };
+        for f in 0..30u64 {
+            let (items, _) = core.track_and_count(&[d("motorcycle", 300, 100, 90, 60), d("person", 200 + 5 * f as i32, 60, 40, 100)], f, f as f64 / 20.0);
+            if f > 5 {
+                assert!(items.iter().any(|it| it.group == Group::Person), "snímka {f}");
+            }
+        }
     }
 
     #[test]

@@ -13,6 +13,7 @@ from PIL import Image, ImageDraw
 from scipy import ndimage
 
 MODEL, IMG, OUT = sys.argv[1:4]
+import os; os.makedirs(OUT, exist_ok=True)
 m = json.load(open(MODEL)); p = m["params"]
 F, K1, K2, CX, CY = p["f"], p["k1"], p["k2"], m["cx"], m["cy"]
 W, H = 3840, 2160
